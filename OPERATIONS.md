@@ -46,3 +46,29 @@ History queries return newest insertions first and do not collect fresh metrics.
 Insertion and retention run in one database transaction. The default retains the newest 1,000 reports across the whole database, not per host. Each invocation stores its final report and alert transitions, not every raw sample. Retention limits row count, not file size; deleted SQLite pages can remain allocated for reuse. SQLite operations wait up to five seconds for a lock. There is no remote synchronisation or deduplication. JSON output and SQLite writes are separate operations: a later failure can leave a successful earlier write in place.
 
 History can contain sensitive host and dependency details. Keep it in the ignored reports directory and restrict access. Twenty-three tests now pass on Windows, including retention, reopening, read-only queries, corrupt database handling and all existing diagnostics. A live save-and-read cycle also passed.
+
+## HTTP readiness
+
+A reachable TCP port does not prove the frontend or API is ready. Check each component explicitly:
+
+```powershell
+.\.venv\Scripts\python system_health.py --http http://localhost:8082/ --http http://127.0.0.1:3000/health --network-timeout 3
+```
+
+These are illustrative local addresses; replace them with your own running services. Each URL expects status 200 by default; `--http-status 204` changes the expected status for all URLs. Checks issue a GET, inspect headers and close without reading the response body. Redirects are reported as unexpected statuses rather than followed. HTTPS uses Python's default certificate verification. Each check has a subprocess timeout covering DNS and I/O, with process cleanup overhead possible.
+
+Use dedicated, read-only readiness endpoints. URLs containing credentials, query strings, fragments or control characters are rejected. No login credentials or response bodies are stored. Connection and TLS failures are reported generically as connection_error. HTTP failures cause overall warning status and exit code 1. Application response headers and bodies are not retained.
+
+Checking localhost and 127.0.0.1 independently can expose address-dependent availability, but cannot prove authentication, cookies, browser CORS behaviour or signup persistence. Those still require application-specific integration tests. A status-only check can also pass for an incorrect page; it does not validate page content.
+
+## Failure regression coverage
+
+- Backend reachable while frontend is unavailable: check both HTTP endpoints explicitly.
+- Preview service stopped: a failed HTTP connection changes overall health to warning.
+- Address-specific behaviour: URLs retain their requested host, allowing separate checks for local aliases.
+- Port open while application is unhealthy: an HTTP 503 fails readiness.
+- Redirect hides the expected endpoint: redirects are not followed automatically.
+- Private exception output: HTTP subprocess stderr is excluded from reports.
+- Partial persistence: a simulated retention failure rolls back the newly inserted SQLite report and preserves prior history.
+
+Twenty-nine automated tests passed on Windows, including real local HTTP server responses, redirects, expected-status overrides, timeout handling and transaction rollback. Linux CI and checks against external applications remain unverified.

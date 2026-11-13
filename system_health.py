@@ -14,6 +14,7 @@ from pathlib import Path
 import psutil
 from network_checks import endpoint, probe, timeout_seconds
 from history_store import recent_reports, save_report
+from http_checks import check_http, http_url
 
 
 def write_report(destination, payload):
@@ -107,6 +108,10 @@ def main(argv=None):
                         help="Consecutive breaches required to open an alert")
     parser.add_argument("--tcp", type=endpoint, action="append", default=[],
                         help="Dependency HOST:PORT to check; repeat for multiple targets")
+    parser.add_argument("--http", type=http_url, action="append", default=[],
+                        help="HTTP(S) readiness URL; repeat for frontend and API")
+    parser.add_argument("--http-status", type=int, choices=range(100, 600), default=200,
+                        metavar="CODE", help="Expected status for all HTTP checks (default: 200)")
     parser.add_argument("--network-timeout", type=timeout_seconds, default=3,
                         help="Total DNS/TCP budget per target, in seconds (default: 3)")
     for metric in ("cpu", "memory", "disk"):
@@ -136,7 +141,9 @@ def main(argv=None):
                                "value": metrics[name], "threshold": limits[name]})
             previous = current
         dependencies = [probe(host, port, args.network_timeout) for host, port in args.tcp]
-        warning = bool(alerts) or any(item["status"] != "reachable" for item in dependencies)
+        http_checks = [check_http(url, args.network_timeout, args.http_status) for url in args.http]
+        warning = (bool(alerts) or any(item["status"] != "reachable" for item in dependencies)
+                   or any(item["status"] != "ready" for item in http_checks))
         report = {
             "schema_version": 1,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -149,6 +156,7 @@ def main(argv=None):
             "alerts": alerts,
             "alert_events": events,
             "dependencies": dependencies,
+            "http_checks": http_checks,
             "status": "warning" if warning else "healthy",
         }
         payload = json.dumps(report, indent=2) + "\n"
