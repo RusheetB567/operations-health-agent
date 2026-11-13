@@ -4,6 +4,7 @@ import os
 import json
 import platform
 import socket
+import sqlite3
 import sys
 import tempfile
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import psutil
 from network_checks import endpoint, probe, timeout_seconds
+from history_store import recent_reports, save_report
 
 
 def write_report(destination, payload):
@@ -94,6 +96,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--disk", type=Path, default=Path.home().anchor)
     parser.add_argument("--output", type=Path, help="Optional report file; contains host information")
+    parser.add_argument("--history-db", type=Path, help="Optional SQLite report history")
+    parser.add_argument("--max-reports", type=positive_integer, default=1000,
+                        help="Maximum retained history records (default: 1000)")
+    parser.add_argument("--show-history", type=positive_integer, metavar="COUNT",
+                        help="Read recent history instead of collecting metrics")
     parser.add_argument("--samples", type=positive_integer, default=1,
                         help="Number of samples; each CPU sample takes one second")
     parser.add_argument("--consecutive", type=positive_integer, default=1,
@@ -105,9 +112,14 @@ def main(argv=None):
     for metric in ("cpu", "memory", "disk"):
         parser.add_argument(f"--{metric}-threshold", type=threshold, default=85)
     args = parser.parse_args(argv)
+    if args.show_history and not args.history_db:
+        parser.error("--show-history requires --history-db")
     if args.consecutive > args.samples:
         parser.error("--consecutive cannot exceed --samples")
     try:
+        if args.show_history:
+            print(json.dumps(recent_reports(args.history_db, args.show_history), indent=2))
+            return 0
         limits = {f"{name}_percent": getattr(args, f"{name}_threshold")
                   for name in ("cpu", "memory", "disk")}
         tracker = AlertTracker(limits, args.consecutive)
@@ -142,9 +154,11 @@ def main(argv=None):
         payload = json.dumps(report, indent=2) + "\n"
         if args.output:
             write_report(args.output, payload)
+        if args.history_db:
+            save_report(args.history_db, report, args.max_reports)
         print(payload, end="")
         return 1 if warning else 0
-    except (OSError, psutil.Error) as error:
+    except (OSError, psutil.Error, sqlite3.Error) as error:
         print(json.dumps({"status": "error", "error": str(error)}), file=sys.stderr)
         return 2
 

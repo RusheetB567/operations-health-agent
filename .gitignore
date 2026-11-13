@@ -5,3 +5,5 @@ reports/
 .env
 .local-deps/
 .local-planning/
+*.sqlite3
+*.sqlite3-*
