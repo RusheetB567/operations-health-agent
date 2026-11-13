@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+reports/
+.env
+.local-deps/
+.local-planning/

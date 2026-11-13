@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "timestamp": "2026-11-13T14:58:36.632738+00:00",
+  "timestamp": "2026-11-13T15:10:38.483486+00:00",
   "hostname": "DESKTOP-77DAJP7",
   "operating_system": "Windows",
   "disk_path": "C:\\",
@@ -10,11 +10,28 @@
     "recovery_margin_percent": 5
   },
   "metrics": {
-    "cpu_percent": 8.0,
-    "memory_percent": 82.5,
-    "disk_percent": 26.1,
-    "uptime_seconds": 7748
+    "cpu_percent": 4.7,
+    "memory_percent": 88.9,
+    "disk_percent": 26.3,
+    "uptime_seconds": 8470
   },
-  "alerts": [],
-  "status": "healthy"
+  "alerts": [
+    {
+      "metric": "memory_percent",
+      "value": 88.9,
+      "threshold": 85
+    }
+  ],
+  "alert_events": [
+    {
+      "metric": "memory_percent",
+      "state": "opened",
+      "sample": 2,
+      "timestamp": "2026-11-13T15:10:37.481632+00:00",
+      "value": 88.9,
+      "threshold": 85
+    }
+  ],
+  "dependencies": [],
+  "status": "warning"
 }
