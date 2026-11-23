@@ -72,3 +72,31 @@ Checking localhost and 127.0.0.1 independently can expose address-dependent avai
 - Partial persistence: a simulated retention failure rolls back the newly inserted SQLite report and preserves prior history.
 
 Twenty-nine automated tests passed on Windows, including real local HTTP server responses, redirects, expected-status overrides, timeout handling and transaction rollback. Linux CI and checks against external applications remain unverified.
+
+## Reusable monitoring profiles
+
+```powershell
+.\.venv\Scripts\python run_profile.py local-profile.example.json
+```
+
+Profiles are JSON objects using the existing CLI option names, without leading dashes. Repeated `tcp` and `http` targets are arrays. Unknown and duplicate options, booleans, nested values and oversized profiles are rejected. Existing CLI validation checks ranges and compatible sample counts. Paths resolve from the current working directory, not the profile directory. Profiles run only when invoked; they do not schedule background services. Review profiles before running: they can choose diagnostic targets and local output paths. Keep personal profiles and real endpoint details out of public commits.
+
+## JSONL log summaries
+
+```powershell
+.\.venv\Scripts\python log_analyzer.py reports/synthetic-log.jsonl
+```
+
+The analyser streams a UTF-8 JSON object per line and counts DEBUG, INFO, WARNING, ERROR, CRITICAL and UNKNOWN severities. WARN maps to WARNING. Blank lines are ignored. Invalid JSON, invalid encoding and malformed records are counted. Lines over 65,536 bytes are discarded in bounded chunks, then parsing resumes at the next line.
+
+The report contains aggregate counts only: raw messages, field values, exception traces and file contents are excluded. This deliberately avoids copying secrets instead of attempting incomplete message redaction. Errors, critical events, malformed records or oversized lines return exit code 1; an unreadable file returns 2. Warnings alone return 0. This is a finite file summary, not a live tailer or incident correlation engine. File processing time scales with total input size.
+
+Verification: all 36 tests passed locally on Windows. A live profile collected and persisted metrics, and a synthetic log smoke test detected an error and malformed line without exposing the seeded secret. Remote CI and Linux execution remain unverified.
+
+### Validate a monitoring profile without running it
+
+```powershell
+.\.venv\Scripts\python run_profile.py local-profile.example.json --check
+```
+
+Validation checks supported options, duplicate keys, exact integer types, numeric ranges, finite numbers, TCP/HTTP targets and compatible sampling counts. It does not collect metrics, contact configured targets, or write outputs. It cannot prove output permissions, service availability or correct installation. Success returns 0; invalid profiles return 2.

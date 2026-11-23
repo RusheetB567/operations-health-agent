@@ -1,0 +1,12 @@
+{
+  "samples": 3,
+  "consecutive": 2,
+  "cpu-threshold": 90,
+  "memory-threshold": 90,
+  "network-timeout": 3,
+  "tcp": [],
+  "http": [],
+  "output": "reports/health.json",
+  "history-db": "reports/history.sqlite3",
+  "max-reports": 1000
+}
