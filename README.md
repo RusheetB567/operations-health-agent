@@ -62,3 +62,13 @@ Hostnames and service addresses can be sensitive. Keep operational reports and l
 - [Profiles and named services](DAY-TWO-REPORT.md)
 - [Regression verification](DAY-2.2-VERIFICATION.md)
 - [Documentation and reproducible demo](DAY-2.3-REPORT.md)
+
+## Offline analytics and export
+
+Generate a numeric dashboard and reviewable exports from synthetic data:
+
+```powershell
+.\.venv\Scripts\python render_dashboard.py examples/service-snapshot.json --output reports/dashboard-preview.html --csv-output reports/dashboard-preview.csv --analytics-output reports/dashboard-analytics.json --redact-targets
+```
+
+Includes group health percentages, P50/P95 probe durations, slow-check highlights, warning/group filters and standard CSV export. These are snapshot statistics rather than historical uptime. See [dashboard analytics guide](docs/OFFLINE-DASHBOARD.md) for commands, safety boundaries and statistical definitions.
