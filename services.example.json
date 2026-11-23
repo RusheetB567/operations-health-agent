@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "services": [
+    {"name": "web-frontend", "group": "application", "type": "http", "target": "http://127.0.0.1:8082/", "timeout": 3, "expected_status": 200},
+    {"name": "backend-api", "group": "application", "type": "http", "target": "http://127.0.0.1:3000/health", "timeout": 3, "expected_status": 200},
+    {"name": "database", "group": "infrastructure", "type": "tcp", "target": "127.0.0.1:5432", "timeout": 2}
+  ]
+}

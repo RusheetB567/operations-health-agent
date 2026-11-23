@@ -1,0 +1,25 @@
+name: reliability regression verification
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  operational-failures:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - name: Exercise actual CLI processes and local failures
+        run: python -m unittest discover -s tests -p test_service_end_to_end.py -v
+      - name: Verify tests detect known behavioural defects
+        run: python tools/verify_regressions.py

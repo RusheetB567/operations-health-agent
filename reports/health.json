@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-11-23T10:16:37.923131+00:00",
+  "hostname": "DESKTOP-77DAJP7",
+  "operating_system": "Windows",
+  "disk_path": "C:\\",
+  "sampling": {
+    "samples": 3,
+    "consecutive_breaches": 2,
+    "recovery_margin_percent": 5
+  },
+  "metrics": {
+    "cpu_percent": 20.4,
+    "memory_percent": 83.3,
+    "disk_percent": 25.0,
+    "uptime_seconds": 439
+  },
+  "alerts": [],
+  "alert_events": [],
+  "dependencies": [],
+  "http_checks": [],
+  "status": "healthy"
+}
