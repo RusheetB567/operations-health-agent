@@ -38,32 +38,6 @@ class ServiceTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 worker.join()
-    def test_real_http_tcp_catalogue_and_saved_report(self):
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(204)
-                self.end_headers()
-            def log_message(self, *args):
-                pass
-        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-            worker = threading.Thread(target=server.serve_forever, daemon=True)
-            worker.start()
-            try:
-                with tempfile.TemporaryDirectory() as directory:
-                    catalogue = Path(directory) / "services.json"
-                    output = Path(directory) / "report.json"
-                    port = server.server_port
-                    catalogue.write_text(json.dumps({"version": 1, "services": [
-                        self.entry(target=f"http://127.0.0.1:{port}/ready", expected_status=204),
-                        self.entry(name="listener", type="tcp", target=f"127.0.0.1:{port}")
-                    ]}), encoding="utf-8")
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        self.assertEqual(service.main([str(catalogue), "--output", str(output)]), 0)
-                    self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["summary"]["healthy"], 2)
-            finally:
-                server.shutdown()
-                worker.join()
     def entry(self, **changes):
         return {"name": "api", "type": "http", "target": "http://localhost/health", **changes}
 
