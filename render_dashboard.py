@@ -13,17 +13,27 @@ def escape(value):
     return html.escape(str(value), quote=True)
 
 
-def render(report, previous=None):
+def render(report, previous=None, redact_targets=False):
     validate_report(report)
     services = report["services"]
     healthy = sum(item["status"] == "healthy" for item in services)
     rows = []
-    for item in services:
+    ordered = sorted(services, key=lambda item: (item["status"] != "warning", item["group"], item["name"]))
+    for item in ordered:
         detail = item["detail"]
         target = detail.get("url", f'{detail.get("host", "—")}:{detail.get("port", "—")}')
+        if redact_targets:
+            target = "[endpoint hidden]"
         rows.append("<tr>" + "".join(f"<td>{escape(value)}</td>" for value in (
             item["name"], item["group"], item["type"], item["status"], detail.get("status", "unknown"),
             target, detail.get("http_status", "—"), detail.get("duration_ms", "—"))) + "</tr>")
+    groups = {}
+    for item in services:
+        counts = groups.setdefault(item["group"], {"healthy": 0, "warning": 0})
+        counts[item["status"]] += 1
+    group_summary = '<section aria-label="Group health"><h2>Group health</h2><ul>' + ''.join(
+        f'<li>{escape(name)}: {counts["healthy"]} healthy, {counts["warning"]} warning</li>'
+        for name, counts in sorted(groups.items())) + '</ul></section>'
     transitions = ""
     if previous is not None:
         delta = compare_reports(previous, report)
@@ -42,9 +52,10 @@ th,td{{padding:.75rem;text-align:left;border-bottom:1px solid #4b607d;overflow-w
 section{{margin-top:2rem}}li{{overflow-wrap:anywhere}}@media print{{body{{background:white;color:black}}table,th{{background:white}}.muted{{color:#333}}}}
 </style></head><body><main><h1>Service health snapshot</h1>
 <p class="muted">Observed: {escape(report.get("timestamp", "not provided"))}. Static evidence; refresh by generating another report.</p>
+<p>Endpoint display: {"hidden" if redact_targets else "visible"}. Service names and groups remain visible.</p>
 <div class="cards"><div class="card">Services<strong>{len(services)}</strong></div>
 <div class="card">Healthy<strong>{healthy}</strong></div><div class="card">Warnings<strong>{len(services)-healthy}</strong></div></div>
-<div class="scroll"><table><caption>Named service diagnostic results</caption><thead><tr>
+{group_summary}<div class="scroll"><table><caption>Named service diagnostic results, warnings first</caption><thead><tr>
 <th scope="col">Service</th><th scope="col">Group</th><th scope="col">Type</th><th scope="col">Health</th>
 <th scope="col">Diagnostic</th><th scope="col">Target</th><th scope="col">HTTP</th><th scope="col">Milliseconds</th>
 </tr></thead><tbody>{''.join(rows)}</tbody></table></div>{transitions}
@@ -57,9 +68,11 @@ def main(argv=None):
     parser.add_argument("report", type=Path)
     parser.add_argument("--previous", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--redact-targets", action="store_true", help="Hide endpoints in the generated HTML")
     args = parser.parse_args(argv)
     try:
-        page = render(load_report(args.report), load_report(args.previous) if args.previous else None)
+        page = render(load_report(args.report), load_report(args.previous) if args.previous else None,
+                      redact_targets=args.redact_targets)
         write_report(args.output, page)
         print(json.dumps({"status": "rendered", "output": str(args.output)}))
         return 0
