@@ -65,7 +65,7 @@ section{{margin-top:2rem}}li{{overflow-wrap:anywhere}}.durations li{{display:fle
 @media(max-width:600px){{body{{padding:1rem}}.card{{flex:1}}}}@media print{{:root{{color-scheme:light}}body{{background:white;color:black}}table,.card,thead th{{background:white}}.muted,a{{color:#333}}nav{{display:none}}}}
 </style></head><body><main><h1>Service health snapshot</h1>
 <p class="muted">Observed: {escape(report.get("timestamp", "not provided"))}. Static evidence; regenerate to update.</p>
-<p>Endpoints {"hidden" if redact_targets else "visible"}; service names and groups remain visible.</p>
+<p>Endpoints {"hidden" if redact_targets else "visible"}. Service names and groups remain visible.</p>
 <nav aria-label="Report sections"><a href="#overview">Overview</a><a href="#groups">Groups</a><a href="#services">Services</a><a href="#duration">Probe durations</a></nav>
 <section id="overview" aria-label="Overview"><div class="cards">{card_html}</div>
 <p>These percentages describe selected services in one snapshot, not uptime or an availability SLA.</p></section>

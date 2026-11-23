@@ -11,3 +11,7 @@ The result separates new failures, recovered services, ongoing failures, healthy
 Exit 0 means all services in the current report are healthy; 1 means at least one currently warns; 2 means invalid report input or file failure. Reports are compared in the order supplied, not sorted by timestamps. This compares two observations; it does not calculate uptime, incident duration or root cause. Host reports and log summaries are rejected.
 
 Review the compared catalogue scopes: a changed group selection may appear as additions/removals. An internal worker error can omit target details and is conservatively treated as a configuration/identity change. Sensitive endpoint data remains local unless you publish the report yourself.
+
+## Input integrity
+
+Report loading rejects duplicate JSON keys at every nesting level, non-finite JSON constants, invalid UTF-8 and files larger than 1 MiB in bytes. This prevents ambiguous reports from silently changing comparison results.

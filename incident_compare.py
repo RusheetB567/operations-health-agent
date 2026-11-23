@@ -5,6 +5,11 @@ import sys
 from pathlib import Path
 
 from system_health import write_report
+from run_profile import unique_object
+
+
+def reject_nonfinite(value):
+    raise ValueError("non-finite JSON number")
 
 
 def validate_report(report):
@@ -27,11 +32,12 @@ def validate_report(report):
 
 
 def load_report(path):
-    with Path(path).open(encoding="utf-8") as stream:
+    with Path(path).open("rb") as stream:
         content = stream.read(1048577)
     if len(content) > 1048576:
-        raise ValueError("service report exceeds one million characters")
-    return validate_report(json.loads(content))
+        raise ValueError("service report exceeds 1 MiB")
+    return validate_report(json.loads(content.decode("utf-8"), object_pairs_hook=unique_object,
+                                      parse_constant=reject_nonfinite))
 
 
 def identity(item):

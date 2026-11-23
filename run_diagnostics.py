@@ -10,6 +10,7 @@ from incident_compare import compare_reports, load_report
 from render_dashboard import render
 from service_monitor import load_catalogue, monitor
 from system_health import write_report
+from artifact_integrity import digest
 
 
 def run(catalogue, output_dir, previous=None, group=None, workers=4):
@@ -32,7 +33,8 @@ def run(catalogue, output_dir, previous=None, group=None, workers=4):
         files["changes"] = "changes.json"
         write_report(bundle / files["changes"], json.dumps(delta, indent=2) + "\n")
     manifest = {"schema_version": 1, "timestamp": datetime.now(timezone.utc).isoformat(),
-                "status": report["status"], "summary": report["summary"], "files": files}
+                "status": report["status"], "summary": report["summary"], "files": files,
+                "sha256": {filename: digest(bundle / filename) for filename in files.values()}}
     write_report(bundle / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     # Publish latest only after the whole bundle has been written successfully.
     write_report(output_dir / "latest.json", json.dumps({"schema_version": 1, "bundle": bundle.name,
