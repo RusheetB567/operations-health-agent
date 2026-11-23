@@ -72,3 +72,7 @@ Generate a numeric dashboard and reviewable exports from synthetic data:
 ```
 
 Includes group health percentages, P50/P95 probe durations, slow-check highlights, warning/group filters and standard CSV export. These are snapshot statistics rather than historical uptime. See [dashboard analytics guide](docs/OFFLINE-DASHBOARD.md) for commands, safety boundaries and statistical definitions.
+
+## Repeated monitoring sessions
+
+Run a finite sequence of catalogue checks, preserve each bundle and track incident opening/recovery. See [monitoring sessions](docs/MONITORING-SESSIONS.md), or try `.\.venv\Scripts\python tools/demo_session.py` for a self-contained loopback demonstration.
