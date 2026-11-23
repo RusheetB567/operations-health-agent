@@ -18,7 +18,8 @@ def render(report, previous=None, redact_targets=False):
     services = report["services"]
     healthy = sum(item["status"] == "healthy" for item in services)
     rows = []
-    for item in services:
+    ordered = sorted(services, key=lambda item: (item["status"] != "warning", item["group"], item["name"]))
+    for item in ordered:
         detail = item["detail"]
         target = detail.get("url", f'{detail.get("host", "—")}:{detail.get("port", "—")}')
         if redact_targets:
@@ -26,6 +27,13 @@ def render(report, previous=None, redact_targets=False):
         rows.append("<tr>" + "".join(f"<td>{escape(value)}</td>" for value in (
             item["name"], item["group"], item["type"], item["status"], detail.get("status", "unknown"),
             target, detail.get("http_status", "—"), detail.get("duration_ms", "—"))) + "</tr>")
+    groups = {}
+    for item in services:
+        counts = groups.setdefault(item["group"], {"healthy": 0, "warning": 0})
+        counts[item["status"]] += 1
+    group_summary = '<section aria-label="Group health"><h2>Group health</h2><ul>' + ''.join(
+        f'<li>{escape(name)}: {counts["healthy"]} healthy, {counts["warning"]} warning</li>'
+        for name, counts in sorted(groups.items())) + '</ul></section>'
     transitions = ""
     if previous is not None:
         delta = compare_reports(previous, report)
@@ -47,7 +55,7 @@ section{{margin-top:2rem}}li{{overflow-wrap:anywhere}}@media print{{body{{backgr
 <p>Endpoint display: {"hidden" if redact_targets else "visible"}. Service names and groups remain visible.</p>
 <div class="cards"><div class="card">Services<strong>{len(services)}</strong></div>
 <div class="card">Healthy<strong>{healthy}</strong></div><div class="card">Warnings<strong>{len(services)-healthy}</strong></div></div>
-<div class="scroll"><table><caption>Named service diagnostic results</caption><thead><tr>
+{group_summary}<div class="scroll"><table><caption>Named service diagnostic results, warnings first</caption><thead><tr>
 <th scope="col">Service</th><th scope="col">Group</th><th scope="col">Type</th><th scope="col">Health</th>
 <th scope="col">Diagnostic</th><th scope="col">Target</th><th scope="col">HTTP</th><th scope="col">Milliseconds</th>
 </tr></thead><tbody>{''.join(rows)}</tbody></table></div>{transitions}

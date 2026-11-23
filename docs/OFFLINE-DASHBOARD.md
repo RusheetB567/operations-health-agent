@@ -13,3 +13,7 @@ Successful rendering returns exit 0 even for a warning snapshot: rendering succe
 ## Hide endpoints in HTML
 
 Add --redact-targets to omit HTTP URLs and TCP host/port values from rendered HTML. Service names, groups and timestamps remain visible; review before sharing. Input JSON is unchanged and still contains targets. This flag does not anonymise the complete report or its other artifacts.
+
+## Triage order
+
+The table lists warnings before healthy services, then sorts by group and service name. Group health totals are computed from the service rows and shown separately, making it easier to identify which part of an application needs investigation. These display changes do not reorder the source JSON report.
