@@ -84,3 +84,13 @@ Use timezone windows and recurring-error groups while excluding raw log fields f
 ```powershell
 .\.venv\Scripts\python triage_logs.py examples/incident-logs.jsonl --output reports/log-triage.json
 ```
+
+## Investigation packs
+
+Combine monitoring observations, privacy-safe log triage and the incident timeline into a verified local package. See [investigation packs](docs/INVESTIGATION-PACKS.md).
+
+```powershell
+.\.venv\Scripts\python investigation_pack.py examples/session-timeline.json examples/incident-logs.jsonl --window-seconds 30 --output-dir reports/investigations
+```
+
+The synthetic example returns warning status while producing a complete integrity-verified pack. Raw logs are not copied into it.
