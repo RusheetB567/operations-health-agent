@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "local-incident-review",
+  "rules": [
+    {"id": "error-volume", "type": "error_records_at_least", "threshold": 5, "severity": "review"},
+    {"id": "repeated-timeouts", "type": "category_records_at_least", "category": "timeout", "threshold": 2, "severity": "review"},
+    {"id": "incomplete-coverage", "type": "coverage_limited", "severity": "block"},
+    {"id": "stale-evidence", "type": "age_minutes_at_least", "threshold": 1440, "severity": "review"}
+  ]
+}
