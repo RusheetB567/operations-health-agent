@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "state": "completed",
+  "events": [
+    {"service": "api", "event": "opened", "cycle": 2, "timestamp": "2026-11-24T10:01:05Z"},
+    {"service": "database", "event": "opened", "cycle": 3, "timestamp": "2026-11-24T10:02:05Z"},
+    {"service": "api", "event": "recovered", "cycle": 4, "timestamp": "2026-11-24T10:04:00Z"}
+  ]
+}
