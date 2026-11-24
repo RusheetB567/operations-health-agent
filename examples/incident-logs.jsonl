@@ -1,0 +1,7 @@
+{"timestamp":"2026-11-24T10:00:00Z","level":"INFO","message":"service started"}
+{"timestamp":"2026-11-24T10:01:00Z","level":"ERROR","message":"request 101 timed out","password":"synthetic-private-value"}
+{"timestamp":"2026-11-24T10:01:30Z","level":"ERROR","message":"request 102 timed out"}
+{"timestamp":"2026-11-24T10:02:00Z","level":"ERROR","message":"database is locked"}
+{"timestamp":"2026-11-24T10:02:30Z","level":"ERROR","message":"database is locked"}
+{"timestamp":"2026-11-24T10:03:00Z","level":"CRITICAL","message":"disk full"}
+{"timestamp":"2026-11-24T10:04:00Z","level":"INFO","message":"service recovered"}

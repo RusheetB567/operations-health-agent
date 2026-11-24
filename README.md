@@ -76,3 +76,11 @@ Includes group health percentages, P50/P95 probe durations, slow-check highlight
 ## Repeated monitoring sessions
 
 Run a finite sequence of catalogue checks, preserve each bundle and track incident opening/recovery. See [monitoring sessions](docs/MONITORING-SESSIONS.md), or try `.\.venv\Scripts\python tools/demo_session.py` for a self-contained loopback demonstration.
+
+## Application log triage
+
+Use timezone windows and recurring-error groups while excluding raw log fields from output. See [log triage](docs/LOG-TRIAGE.md) and the [Day 3.1 report](DAY-3.1-REPORT.md).
+
+```powershell
+.\.venv\Scripts\python triage_logs.py examples/incident-logs.jsonl --output reports/log-triage.json
+```
