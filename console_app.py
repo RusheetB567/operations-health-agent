@@ -110,8 +110,12 @@ CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY,service_id TEXT NOT NUL
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_incident ON incidents(service_id,revision) WHERE state IN ('open','acknowledged');
 CREATE TABLE IF NOT EXISTS incident_events(id INTEGER PRIMARY KEY AUTOINCREMENT,incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,kind TEXT NOT NULL,created_at TEXT NOT NULL,detail TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS console_settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS maintenance(id TEXT PRIMARY KEY,service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,reason TEXT NOT NULL,started_at REAL NOT NULL,expires_at REAL NOT NULL,ended_at REAL);
 CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,summary TEXT NOT NULL);
 ''')
+            for table in ("services", "observations"):
+                if "maintenance_version" not in {column["name"] for column in db.execute(f"PRAGMA table_info({table})")}:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN maintenance_version INTEGER NOT NULL DEFAULT 0")
             if "source" not in {column["name"] for column in db.execute("PRAGMA table_info(runs)")}:
                 db.execute("ALTER TABLE runs ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
             saved = db.execute("SELECT value FROM console_settings WHERE key='interval_seconds'").fetchone()
@@ -193,13 +197,52 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             rows = db.execute("SELECT * FROM services ORDER BY created_at,id").fetchall()
             results = []
             for row in rows:
-                last = db.execute("SELECT o.payload,r.finished_at FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND r.state='completed' ORDER BY r.finished_at DESC LIMIT 1", (row["id"], row["revision"])).fetchone()
+                last = db.execute("SELECT o.payload,r.finished_at FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' ORDER BY r.finished_at DESC LIMIT 1", (row["id"], row["revision"], row["maintenance_version"])).fetchone()
                 value = {"id": row["id"], "name": row["name"], "group": row["group_name"], "type": row["protocol"],
                          "target": row["target"], "timeout": row["timeout"], "expected_status": row["expected_status"],
                          "enabled": bool(row["enabled"]), "is_demo": bool(row["is_demo"]), "revision": row["revision"],
                          "last": json.loads(last["payload"]) if last else None, "checked_at": last["finished_at"] if last else None}
+                window=db.execute("SELECT id,reason,expires_at FROM maintenance WHERE service_id=? AND ended_at IS NULL AND expires_at>? ORDER BY started_at DESC LIMIT 1", (row["id"],time.time())).fetchone()
+                value["maintenance"] = dict(window) if window else None
+                value["maintenance_version"] = row["maintenance_version"]
                 results.append(value)
             return results
+
+    def maintenance_windows(self):
+        with self.db() as db:
+            rows=db.execute("SELECT m.*,s.name AS service_name FROM maintenance m JOIN services s ON s.id=m.service_id ORDER BY started_at DESC LIMIT 250").fetchall()
+        result=[]
+        for row in rows:
+            item=dict(row)
+            item["state"]="ended" if item["ended_at"] is not None else "expired" if item["expires_at"] <= time.time() else "active"
+            result.append(item)
+        return result
+
+    def start_maintenance(self, service_id, payload):
+        if set(payload) != {"duration_minutes","reason"} or type(payload.get("duration_minutes")) is not int or not 1 <= payload["duration_minutes"] <= 1440:
+            raise RequestError("Choose a maintenance duration from 1 to 1,440 whole minutes.")
+        reason=payload["reason"]
+        if not isinstance(reason,str) or not reason.strip() or len(reason)>300 or any(ord(c)<32 for c in reason):
+            raise RequestError("Enter a reason of 1–300 characters without control characters.")
+        with self.lock, self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM services WHERE id=?",(service_id,)).fetchone():
+                raise RequestError("Service not found.",404)
+            timestamp=time.time()
+            if db.execute("SELECT 1 FROM maintenance WHERE service_id=? AND ended_at IS NULL AND expires_at>?",(service_id,timestamp)).fetchone():
+                raise RequestError("This service already has an active maintenance window.",409)
+            identity=uuid.uuid4().hex
+            db.execute("INSERT INTO maintenance VALUES(?,?,?,?,?,NULL)",(identity,service_id,reason.strip(),timestamp,timestamp+payload["duration_minutes"]*60))
+            # A new generation prevents old or in-flight observations from claiming current health.
+            db.execute("UPDATE services SET maintenance_version=maintenance_version+1 WHERE id=?",(service_id,))
+            db.execute("DELETE FROM maintenance WHERE (ended_at IS NOT NULL OR expires_at<=?) AND id NOT IN (SELECT id FROM maintenance WHERE ended_at IS NOT NULL OR expires_at<=? ORDER BY started_at DESC LIMIT 200)",(timestamp,timestamp))
+        return {"id":identity}
+
+    def end_maintenance(self, identity):
+        with self.lock, self.db() as db:
+            if db.execute("UPDATE maintenance SET ended_at=? WHERE id=? AND ended_at IS NULL AND expires_at>?",(time.time(),identity,time.time())).rowcount != 1:
+                raise RequestError("The maintenance window has already ended or was not found.",404)
+        return {"ended":True}
 
     def save_service(self, payload, identity=None):
         fields = service_fields(payload)
@@ -217,7 +260,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                     db.execute("UPDATE services SET name=?,group_name=?,protocol=?,target=?,timeout=?,expected_status=?,enabled=?,revision=revision+? WHERE id=?", (fields["name"], fields["group"], fields["type"], fields["target"], fields["timeout"], fields["expected_status"], int(fields["enabled"]), int(changed), identity))
                 else:
                     identity = uuid.uuid4().hex
-                    db.execute("INSERT INTO services VALUES(?,?,?,?,?,?,?,?,?,?,?)", (identity, fields["name"], fields["group"], fields["type"], fields["target"], fields["timeout"], fields["expected_status"], int(fields["enabled"]), 1, 0, now()))
+                    db.execute("INSERT INTO services(id,name,group_name,protocol,target,timeout,expected_status,enabled,revision,is_demo,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (identity, fields["name"], fields["group"], fields["type"], fields["target"], fields["timeout"], fields["expected_status"], int(fields["enabled"]), 1, 0, now()))
             except sqlite3.IntegrityError:
                 raise RequestError("A service with this name already exists.", 409) from None
         return {"id": identity}
@@ -241,8 +284,10 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
 
     def _observe_incident(self, db, source, result):
         # Ignore results from configurations that were edited, paused or removed mid-run.
-        current = db.execute("SELECT revision,enabled FROM services WHERE id=?", (source["id"],)).fetchone()
-        if not current or current["revision"] != source["revision"] or not current["enabled"]:
+        current = db.execute("SELECT revision,enabled,maintenance_version FROM services WHERE id=?", (source["id"],)).fetchone()
+        if not current or current["revision"] != source["revision"] or not current["enabled"] or current["maintenance_version"] != source["maintenance_version"]:
+            return
+        if db.execute("SELECT 1 FROM maintenance WHERE service_id=? AND ended_at IS NULL AND expires_at>?",(source["id"],time.time())).fetchone():
             return
         incident = db.execute("SELECT id FROM incidents WHERE service_id=? AND revision=? AND state IN ('open','acknowledged')", (source["id"], source["revision"])).fetchone()
         if result["status"] == "healthy":
@@ -268,6 +313,51 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 item["events"] = [dict(event) for event in db.execute("SELECT kind,created_at,detail FROM incident_events WHERE incident_id=? ORDER BY id DESC LIMIT 50", (row["id"],))]
                 result.append(item)
             return result
+
+    def export_incident(self, identity, payload):
+        if set(payload) != {"format","include_notes"} or payload.get("format") not in ("json","markdown") or type(payload.get("include_notes")) is not bool:
+            raise RequestError("Choose JSON or Markdown and whether to include investigation notes.")
+        with self.db() as db:
+            db.execute("BEGIN")  # One consistent snapshot across incident, activity and retained evidence.
+            row=db.execute("SELECT * FROM incidents WHERE id=?",(identity,)).fetchone()
+            if not row:
+                raise RequestError("Incident not found; it may have expired from history.",404)
+            incident=dict(row)
+            events=[dict(item) for item in db.execute("SELECT kind,created_at,detail FROM incident_events WHERE incident_id=? ORDER BY id LIMIT 200",(identity,)) if payload["include_notes"] or item["kind"] != "note"]
+            records=db.execute("SELECT r.id,r.finished_at,r.source,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND r.state='completed' AND r.finished_at>=? AND r.started_at<=? ORDER BY r.finished_at DESC LIMIT 101",(incident["service_id"],incident["revision"],incident["opened_at"],incident["resolved_at"] or now())).fetchall()
+        evidence=[]
+        for item in reversed(records[:100]):
+            result=json.loads(item["payload"])
+            detail=result.get("detail",{})
+            measured=detail.get("duration_ms")
+            evidence.append({"run_id":item["id"],"finished_at":item["finished_at"],"source":item["source"],"status":result.get("status"),
+                             "probe_status":detail.get("status"),"http_status":detail.get("http_status"),
+                             "duration_ms":measured if type(measured) in (int,float) and math.isfinite(measured) and measured>=0 else None})
+        report={"schema_version":1,"report_type":"incident-handoff","generated_at":now(),
+                "incident":{key:incident[key] for key in ("id","service_name","target","revision","state","owner","opened_at","last_seen","resolved_at","resolution","failures","version")},
+                "activity":events,"evidence":evidence,
+                "scope":{"notes_included":payload["include_notes"],"evidence_limit":100,"evidence_truncated":len(records)>100,
+                         "retained_history_only":True,"notice":"Evidence contains retained observations for this service revision during the incident window. Older runs may have expired. Observations do not establish a root cause. Owner is a local label, not an authenticated identity."}}
+        if payload["format"] == "json":
+            content=json.dumps(report,indent=2,ensure_ascii=False)+"\n"
+            extension,media_type="json","application/json"
+        else:
+            # Indented blocks keep user-authored notes/labels as literal text, including HTML/Markdown.
+            def literal(value):
+                return "\n".join("    "+line for line in str(value if value is not None else "Not recorded").splitlines()) or "    Not recorded"
+            lines=["# Incident handoff", "", "Generated: "+report["generated_at"], ""]
+            for label,key in (("Incident ID","id"),("Service","service_name"),("Target","target"),("State","state"),("Owner","owner"),("Opened","opened_at"),("Last warning","last_seen"),("Resolved","resolved_at"),("Resolution","resolution"),("Observed failed checks","failures")):
+                lines.extend(["## "+label,"",literal(incident[key]),""])
+            lines.extend(["## Scope","",report["scope"]["notice"],"", "Investigation notes included: "+str(payload["include_notes"]), "", "## Activity", ""])
+            for event in events:
+                lines.extend([event["created_at"]+" — "+event["kind"],"",literal(event["detail"]),""])
+            lines.extend(["## Retained check evidence","",f"Included {len(evidence)} observations; limit 100. Truncated: {len(records)>100}.",""])
+            for item in evidence:
+                lines.extend([literal(json.dumps(item,ensure_ascii=False)),""])
+            content="\n".join(lines)
+            extension,media_type="md","text/markdown"
+        return {"filename":f"incident-{identity}.{extension}","media_type":media_type,"content":content,
+                "summary":{"state":incident["state"],"activity_entries":len(events),"evidence_entries":len(evidence),"notes_included":payload["include_notes"]}}
 
     def update_incident(self, identity, payload):
         if set(payload) - {"version", "action", "owner", "note"} or type(payload.get("version")) is not int:
@@ -319,15 +409,73 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
         return [{"id": row["id"], "state": row["state"], "started_at": row["started_at"], "finished_at": row["finished_at"],
                  "report": json.loads(row["report"]) if row["report"] else None, "error": row["error"], "source": row["source"]} for row in rows]
 
+    def compare_runs(self, payload):
+        from incident_compare import compare_reports, identity, validate_report
+        if set(payload) != {"baseline_id","current_id"} or any(not isinstance(payload[k],str) or not payload[k] or len(payload[k])>64 for k in payload):
+            raise RequestError("Choose two saved runs to compare.")
+        if payload["baseline_id"] == payload["current_id"]:
+            raise RequestError("Choose two different runs.")
+        with self.db() as db:
+            records=[]
+            observations=[]
+            for key in ("baseline_id","current_id"):
+                row=db.execute("SELECT * FROM runs WHERE id=?",(payload[key],)).fetchone()
+                if not row:
+                    raise RequestError("A selected run was not found; it may have expired from history.",404)
+                if row["state"] != "completed" or not row["report"]:
+                    raise RequestError("Only completed check runs can be compared.",409)
+                try:
+                    report=validate_report(json.loads(row["report"]))
+                    items={item["service_id"]:dict(item) for item in db.execute("SELECT * FROM observations WHERE run_id=?",(row["id"],))}
+                    if len(items) != len(report["services"]):
+                        raise ValueError
+                    for item in items.values():
+                        item["result"]=json.loads(item["payload"])
+                        validate_report({"schema_version":1,"services":[item["result"]]})
+                except (ValueError,TypeError,KeyError):
+                    raise RequestError("This run lacks complete comparison metadata.",409) from None
+                records.append({"id":row["id"],"started_at":row["started_at"],"source":row["source"]})
+                observations.append(items)
+        if records[0]["started_at"] >= records[1]["started_at"]:
+            raise RequestError("The baseline must be older than the current run.")
+        before,after=observations
+        counts={key:0 for key in ("new_failure","recovered","ongoing_failure","unchanged_healthy","added_to_run","absent_from_run","configuration_changed","maintenance_boundary")}
+        rows=[]
+        for service_id in before.keys() | after.keys():
+            old,new=before.get(service_id),after.get(service_id)
+            old_result=old["result"] if old else None
+            new_result=new["result"] if new else None
+            if old is None:
+                classification="added_to_run"
+            elif new is None:
+                classification="absent_from_run"
+            elif old["revision"] != new["revision"] or identity(old_result) != identity(new_result):
+                classification="configuration_changed"
+            elif old["maintenance_version"] != new["maintenance_version"]:
+                classification="maintenance_boundary"
+            else:
+                comparison=compare_reports({"schema_version":1,"services":[old_result]}, {"schema_version":1,"services":[new_result]})
+                classification=next({"new_failures":"new_failure","recovered":"recovered","ongoing_failures":"ongoing_failure","unchanged_healthy":"unchanged_healthy","reconfigured":"configuration_changed"}[key] for key,value in comparison["counts"].items() if value)
+            def measured(result):
+                value=result["detail"].get("duration_ms") if result else None
+                return value if type(value) in (int,float) and math.isfinite(value) and value>=0 else None
+            old_ms,new_ms=measured(old_result),measured(new_result)
+            counts[classification]+=1
+            rows.append({"service_id":service_id,"name":(new_result or old_result)["name"],"classification":classification,
+                         "previous_status":old_result["status"] if old else None,"current_status":new_result["status"] if new else None,
+                         "previous_duration_ms":old_ms,"current_duration_ms":new_ms,
+                         "duration_delta_ms":round(new_ms-old_ms,2) if old_ms is not None and new_ms is not None and classification in ("new_failure","recovered","ongoing_failure","unchanged_healthy") else None})
+        return {"baseline":records[0],"current":records[1],"counts":counts,"services":sorted(rows,key=lambda item:(item["name"],item["service_id"]))}
+
     def start_check(self, ids=None, source="manual"):
         if ids is not None and (not isinstance(ids, list) or not ids or len(ids) > 50 or any(not isinstance(value, str) for value in ids)):
             raise RequestError("Select one or more service IDs.")
         with self.lock:
             if self.closing:
                 raise RequestError("The console is stopping.", 409)
-            snapshots = [item for item in self.services() if item["enabled"] and (ids is None or item["id"] in ids)]
+            snapshots = [item for item in self.services() if item["enabled"] and not item["maintenance"] and (ids is None or item["id"] in ids)]
             if not snapshots:
-                raise RequestError("Add or enable a service first.")
+                raise RequestError("Add or enable a service outside maintenance first.")
             with self.db() as db:
                 if db.execute("SELECT COUNT(*) FROM runs WHERE state IN ('queued','running')").fetchone()[0]:
                     raise RequestError("A check is already running. Please wait for it to finish.", 409)
@@ -346,7 +494,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 for result in report["services"]:
                     source = indexed[result["name"]]
                     self._observe_incident(db, source, result)
-                    db.execute("INSERT INTO observations VALUES(?,?,?,?)", (identity, source["id"], source["revision"], json.dumps(result)))
+                    db.execute("INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,?,?,?)", (identity, source["id"], source["revision"], json.dumps(result), source["maintenance_version"]))
                 db.execute("UPDATE runs SET state='completed',finished_at=?,report=? WHERE id=?", (now(), json.dumps(report), identity))
                 db.execute("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY started_at DESC LIMIT 200)")
         except Exception:
@@ -380,7 +528,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                     if current:
                         db.execute("UPDATE services SET target=?,enabled=1,revision=revision+? WHERE id=?", (target, int(current["target"] != target), current["id"]))
                     else:
-                        db.execute("INSERT INTO services VALUES(?,?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, name, "local-lab", protocol, target, 3, 200, 1, 1, 1, now()))
+                        db.execute("INSERT INTO services(id,name,group_name,protocol,target,timeout,expected_status,enabled,revision,is_demo,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, name, "local-lab", protocol, target, 3, 200, 1, 1, 1, now()))
         elif not any(item["is_demo"] for item in self.services()):
             raise RequestError("Load the local lab first.")
         with self.lock:
@@ -392,12 +540,13 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
         services = self.services()
         runs = self.runs()
         enabled = [item for item in services if item["enabled"]]
-        durations = sorted(item["last"]["detail"].get("duration_ms", 0) for item in enabled if item["last"])
+        monitoring = [item for item in enabled if not item["maintenance"]]
+        durations = sorted(item["last"]["detail"].get("duration_ms", 0) for item in monitoring if item["last"])
         memory = psutil.virtual_memory()
-        return {"services": services, "runs": runs, "incidents": self.incidents(), "schedule": self.schedule_status(), "summary": {
-            "total": len(services), "enabled": len(enabled), "healthy": sum(bool(item["last"] and item["last"]["status"] == "healthy") for item in enabled),
-            "warning": sum(bool(item["last"] and item["last"]["status"] != "healthy") for item in enabled),
-            "unchecked": sum(item["last"] is None for item in enabled), "p95_ms": durations[max(0, math.ceil(len(durations) * .95) - 1)] if durations else None},
+        return {"services": services, "runs": runs, "incidents": self.incidents(), "schedule": self.schedule_status(), "maintenance_windows": self.maintenance_windows(), "summary": {
+            "total": len(services), "enabled": len(enabled), "monitoring":len(monitoring), "maintenance":len(enabled)-len(monitoring), "healthy": sum(bool(item["last"] and item["last"]["status"] == "healthy") for item in monitoring),
+            "warning": sum(bool(item["last"] and item["last"]["status"] != "healthy") for item in monitoring),
+            "unchecked": sum(item["last"] is None for item in monitoring), "p95_ms": durations[max(0, math.ceil(len(durations) * .95) - 1)] if durations else None},
             "active_run": next((item["id"] for item in runs if item["state"] in ("queued", "running")), None),
             "host": {"hostname": socket.gethostname(), "memory_percent": memory.percent, "uptime_seconds": max(0, int(time.time() - psutil.boot_time()))},
             "lab": {"loaded": any(item["is_demo"] for item in services), "degraded": self.demo_degraded}}
@@ -561,12 +710,22 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             payload = self.body() if method in ("POST", "PATCH") else {}
             if method == "PATCH" and path.startswith("/api/incidents/"):
                 return self.response(200, self.state.update_incident(path.split("/")[-1], payload))
+            if method == "POST" and path.startswith("/api/services/") and path.endswith("/maintenance"):
+                return self.response(201, self.state.start_maintenance(path.split("/")[3], payload))
+            if method == "POST" and path.startswith("/api/maintenance/") and path.endswith("/end"):
+                if payload:
+                    raise RequestError("End maintenance takes no options.")
+                return self.response(200,self.state.end_maintenance(path.split("/")[3]))
             if method == "POST" and path == "/api/services":
                 return self.response(201, self.state.save_service(payload))
             if method == "PATCH" and path.startswith("/api/services/"):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
             if method == "PATCH" and path == "/api/schedule":
                 return self.response(200, self.state.configure_schedule(payload))
+            if method == "POST" and path.startswith("/api/incidents/") and path.endswith("/export"):
+                return self.response(200,self.state.export_incident(path.split("/")[3],payload))
+            if method == "POST" and path == "/api/runs/compare":
+                return self.response(200,self.state.compare_runs(payload))
             if method == "POST" and path == "/api/checks":
                 if set(payload) - {"service_ids"}:
                     raise RequestError("Unsupported check options.")

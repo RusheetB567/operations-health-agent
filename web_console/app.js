@@ -27,7 +27,7 @@ const duration = value => Number.isFinite(value) ? `${Math.round(value)} ms` : '
 const empty = (title, description) => `<div class="empty-state"><div class="empty-icon">⌁</div><strong>${esc(title)}</strong><p>${esc(description)}</p></div>`;
 function serviceTable(items, compact=false) {
  if (!items.length) return empty('No services here yet', 'Add a local endpoint or start the controlled lab.');
- return `<div class="table-wrap"><table><thead><tr><th>Service</th><th>Status</th><th>Duration</th>${compact ? '' : '<th>Group</th>'}<th>Actions</th></tr></thead><tbody>${items.map(s => `<tr><td><div class="service-cell"><span class="service-glyph">${s.type === 'http' ? 'H' : 'T'}</span><div><div class="service-name">${esc(s.name)} ${s.is_demo ? '<span class="protocol">LAB</span>' : ''}</div><div class="service-target" title="${esc(s.target)}">${esc(s.target)}</div></div></div></td><td>${badge(!s.enabled ? 'paused' : s.last?.status || 'unchecked')}</td><td class="mono">${duration(s.last?.detail?.duration_ms)}</td>${compact ? '' : `<td>${esc(s.group)}</td>`}<td><div class="row-actions"><button class="text-button" data-check="${s.id}" ${!s.enabled || model.active_run ? 'disabled' : ''}>Check</button>${compact ? '' : `<button class="text-button" data-edit="${s.id}">Edit</button><button class="text-button" data-toggle="${s.id}">${s.enabled ? 'Pause' : 'Enable'}</button><button class="text-button destructive" data-delete="${s.id}">Remove</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
+ return `<div class="table-wrap"><table><thead><tr><th>Service</th><th>Status</th><th>Duration</th>${compact ? '' : '<th>Group</th>'}<th>Actions</th></tr></thead><tbody>${items.map(s => `<tr><td><div class="service-cell"><span class="service-glyph">${s.type === 'http' ? 'H' : 'T'}</span><div><div class="service-name">${esc(s.name)} ${s.is_demo ? '<span class="protocol">LAB</span>' : ''}</div><div class="service-target" title="${esc(s.target)}">${esc(s.target)}</div></div></div></td><td>${badge(!s.enabled ? 'paused' : s.maintenance ? 'maintenance' : s.last?.status || 'unchecked')}</td><td class="mono">${duration(s.last?.detail?.duration_ms)}</td>${compact ? '' : `<td>${esc(s.group)}</td>`}<td><div class="row-actions"><button class="text-button" data-check="${s.id}" ${!s.enabled || s.maintenance || model.active_run ? 'disabled' : ''}>Check</button>${compact ? '' : `<button class="text-button" data-edit="${s.id}">Edit</button><button class="text-button" data-toggle="${s.id}">${s.enabled ? 'Pause' : 'Enable'}</button><button class="text-button" data-maintenance="${s.id}">${s.maintenance ? 'View maintenance' : 'Maintenance'}</button><button class="text-button destructive" data-delete="${s.id}">Remove</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
 function runTable(items) {
  if (!items.length) return empty('Your check history starts here', 'Run a check to save an observation.');
@@ -44,9 +44,11 @@ function render() {
  const {summary:s,services,runs,host,lab}=model;
  renderIncidents();
  renderSchedule();
+ renderMaintenance();
+ renderRunChoices();
  $('nav-service-count').textContent=s.total;
  $('metric-enabled').textContent=s.enabled; $('metric-healthy').textContent=s.healthy; $('metric-warning').textContent=s.warning;
- $('metric-enabled-caption').textContent=`${s.total-s.enabled} paused · ${s.unchecked} unchecked`;
+ $('metric-enabled-caption').textContent=`${s.total-s.enabled} paused · ${s.maintenance} in maintenance · ${s.unchecked} unchecked`;
  $('metric-warning-caption').textContent=s.warning ? 'Review the latest observations' : 'No warnings in checked services';
  $('metric-duration').textContent=duration(s.p95_ms);
  $('overview-service-table').innerHTML=serviceTable(services.slice(0,5),true);
@@ -55,9 +57,10 @@ function render() {
  $('group-filter').value=selected; renderServices();
  $('runs-table').innerHTML=runTable(runs);
  $('recent-runs').innerHTML=runs.length ? runs.slice(0,3).map(r=>`<div class="run-line"><span class="run-symbol">${r.state==='completed' ? '✓' : '⌁'}</span><div><strong>${r.report ? `${r.report.summary.total} services checked` : esc(r.state)}</strong><p>${date(r.started_at)}</p></div>${badge(r.report?.status || r.state)}<button class="text-button" data-run="${r.id}">Details</button></div>`).join('') : empty('No check runs yet','Start the lab or connect your first service.');
- const pct=s.enabled ? Math.round(s.healthy/s.enabled*100) : 0;
- $('health-percent').textContent=s.enabled ? `${pct}%` : '—';
- $('health-ring').style.background=`conic-gradient(#28a381 0% ${pct}%, #f0b74b ${pct}% ${s.enabled ? (s.healthy+s.warning)/s.enabled*100 : 0}%, #e9edf4 0%)`;
+ const monitored=s.monitoring;
+ const pct=monitored ? Math.round(s.healthy/monitored*100) : 0;
+ $('health-percent').textContent=monitored ? `${pct}%` : '—';
+ $('health-ring').style.background=`conic-gradient(#28a381 0% ${pct}%, #f0b74b ${pct}% ${monitored ? (s.healthy+s.warning)/monitored*100 : 0}%, #e9edf4 0%)`;
  $('health-legend').innerHTML=[['Healthy',s.healthy,'#28a381'],['Warning',s.warning,'#f0b74b'],['Unchecked',s.unchecked,'#dce2ed']].map(([label,n,color])=>`<div class="legend-item"><span class="legend-square" style="background:${color}"></span>${label}<strong>${n}</strong></div>`).join('');
  $('host-name').textContent=host.hostname; $('host-memory').textContent=`${host.memory_percent}%`; $('memory-bar').style.width=`${host.memory_percent}%`;
  $('host-uptime').textContent=`${Math.floor(host.uptime_seconds/86400)}d ${Math.floor(host.uptime_seconds%86400/3600)}h`;
@@ -65,7 +68,7 @@ function render() {
  $('lab-description').textContent=!lab.loaded ? 'Start with a local lab: three real endpoints, one controlled failure, and a recovery you can verify.' : lab.degraded ? 'The lab worker returns HTTP 503. Restore it and compare the saved observations.' : 'The lab worker now returns HTTP 200. Introduce another failure whenever you want to practise.';
  $('lab-action').textContent=!lab.loaded ? 'Start local lab' : lab.degraded ? 'Recover lab worker' : 'Simulate failure';
  $('lab-action').disabled=Boolean(model.active_run);
- $('run-checks-button').disabled=Boolean(model.active_run) || !s.enabled;
+ $('run-checks-button').disabled=Boolean(model.active_run) || !s.monitoring;
  $('run-checks-button').querySelector('span').textContent=model.active_run ? 'Checking…' : 'Run checks';
  $('updated-at').textContent=`Updated ${new Date().toLocaleTimeString()}`;
 }
@@ -118,6 +121,8 @@ document.addEventListener('click',async event=>{
  if(d.view || d.go) location.hash=d.view || d.go;
  if(d.close) $(d.close).close();
  if(d.incident) openIncident(d.incident);
+ if(d.maintenance) openMaintenance(d.maintenance);
+ if(d.endMaintenance) {if(await change(`/api/maintenance/${d.endMaintenance}/end`,'POST',{})) {toast('Maintenance ended. The next check can observe this service.');}}
  if(d.edit) openService(d.edit);
  if(d.check) await change('/api/checks','POST',{service_ids:[d.check]});
  if(d.toggle) {
@@ -171,6 +176,8 @@ function renderIncidents() {
 function openIncident(identity) {
  const incident=model.incidents.find(i=>i.id===identity); if(!incident)return;
  incidentSelection={id:identity,version:incident.version};
+ $('export-notes').checked=false;
+ resetIncidentExport();
  $('incident-title').textContent=incident.service_name;
  $('incident-summary').innerHTML=`<div class="run-detail-summary">${badge(incident.state)}<span>Opened ${date(incident.opened_at)}</span></div><p class="mono incident-target">${esc(incident.target)}</p><p>${incident.failures} failed checks observed${incident.resolution ? ` · ${esc(incident.resolution.replaceAll('_',' '))} at ${date(incident.resolved_at)}` : ''}</p>`;
  $('incident-owner').value=incident.owner; $('incident-note').value=''; $('incident-form-error').hidden=true;
@@ -217,6 +224,76 @@ async function setSchedule(enabled) {
 }
 $('schedule-form').onsubmit=event=>{event.preventDefault();setSchedule(true);};
 $('schedule-stop').onclick=()=>setSchedule(false);
+let maintenanceService = null;
+const windowDate=value=>date(new Date(value*1000).toISOString());
+function renderMaintenance() {
+ const windows=model.maintenance_windows || [];
+ $('maintenance-history').innerHTML=windows.length ? `<div class="table-wrap"><table><thead><tr><th>Service</th><th>Reason</th><th>Status</th><th>Planned end</th><th>Actions</th></tr></thead><tbody>${windows.map(w=>`<tr><td>${esc(w.service_name)}</td><td class="maintenance-reason">${esc(w.reason)}</td><td>${badge(w.state)}</td><td>${windowDate(w.expires_at)}</td><td>${w.state==='active' ? `<button class="text-button" data-end-maintenance="${w.id}">End now</button>` : '—'}</td></tr>`).join('')}</tbody></table></div>` : empty('No maintenance windows yet','Use a service’s Maintenance control before planned work.');
+}
+function openMaintenance(identity) {
+ const service=model.services.find(s=>s.id===identity);if(!service)return;
+ if(service.maintenance){location.hash='services';toast(`Maintenance until ${windowDate(service.maintenance.expires_at)}: ${service.maintenance.reason}`);return;}
+ maintenanceService=identity;
+ $('maintenance-service-name').textContent=service.name;
+ $('maintenance-form').reset();$('maintenance-error').hidden=true;
+ $('maintenance-dialog').showModal();
+}
+$('maintenance-form').onsubmit=async event=>{
+ event.preventDefault();$('maintenance-save').disabled=true;
+ try {
+  await api(`/api/services/${maintenanceService}/maintenance`,'POST',{duration_minutes:Number($('maintenance-duration').value),reason:$('maintenance-reason').value});
+  $('maintenance-dialog').close();await refresh();toast('Maintenance started. Existing incidents stay open.');
+ }catch(error){$('maintenance-error').textContent=error.message;$('maintenance-error').hidden=false;}
+ finally{$('maintenance-save').disabled=false;}
+};
+const comparisonLabels={new_failure:'New failure',recovered:'Recovered',ongoing_failure:'Ongoing failure',unchanged_healthy:'Still healthy',added_to_run:'Added to run',absent_from_run:'Absent from run',configuration_changed:'Configuration changed',maintenance_boundary:'Maintenance boundary'};
+let comparisonBusy=false;
+function renderRunChoices() {
+ const completed=model.runs.filter(r=>r.state==='completed');
+ for(const id of ['compare-baseline','compare-current']) {
+  const select=$(id),previous=select.value;
+  if(document.activeElement===select)continue;
+  select.innerHTML=completed.map(r=>`<option value="${r.id}">${date(r.started_at)} · ${esc(r.source || 'manual')} · ${r.report.summary.healthy}/${r.report.summary.total} healthy · ${r.id.slice(0,6)}</option>`).join('');
+  if(completed.some(r=>r.id===previous))select.value=previous;
+  else select.value=(id==='compare-baseline' ? completed[1] : completed[0])?.id || '';
+ }
+ $('compare-submit').disabled=comparisonBusy || completed.length<2;
+ if(completed.length<2 && !$('compare-results').hasChildNodes())$('compare-results').innerHTML=empty('Two completed runs are needed','Run checks before and after a change, then compare the observations.');
+}
+$('compare-form').onsubmit=async event=>{
+ event.preventDefault();comparisonBusy=true;$('compare-submit').disabled=true;$('compare-error').hidden=true;
+ try {
+  const report=await api('/api/runs/compare','POST',{baseline_id:$('compare-baseline').value,current_id:$('compare-current').value});
+  const changes=Object.entries(report.counts).filter(([,count])=>count>0);
+  $('compare-results').innerHTML=`<div class="comparison-summary">${changes.map(([key,count])=>`<div><strong>${count}</strong><span>${comparisonLabels[key]}</span></div>`).join('')}</div><p class="small-note left comparison-caption">Baseline ${date(report.baseline.started_at)} compared with ${date(report.current.started_at)}. Absent services may be paused, in maintenance or outside a partial check. Duration differences are observations, not a performance guarantee.</p><div class="table-wrap"><table><thead><tr><th>Service</th><th>Change</th><th>Before</th><th>After</th><th>Duration difference</th></tr></thead><tbody>${report.services.map(s=>`<tr><td>${esc(s.name)}</td><td>${comparisonLabels[s.classification]}</td><td>${s.previous_status ? badge(s.previous_status) : 'Not observed'}</td><td>${s.current_status ? badge(s.current_status) : 'Not observed'}</td><td class="mono">${s.duration_delta_ms===null ? 'Not comparable' : `${s.duration_delta_ms>0 ? '+' : ''}${s.duration_delta_ms} ms`}</td></tr>`).join('')}</tbody></table></div>`;
+ }catch(error){$('compare-error').textContent=error.message;$('compare-error').hidden=false;$('compare-results').replaceChildren();}
+ finally{comparisonBusy=false;renderRunChoices();}
+};
+let incidentExport=null;
+function resetIncidentExport() {
+ incidentExport=null;$('export-download').disabled=true;$('export-content').hidden=true;$('export-content').textContent='';$('export-summary').hidden=true;$('export-error').hidden=true;
+}
+$('export-format').onchange=resetIncidentExport;
+$('export-notes').onchange=resetIncidentExport;
+$('export-preview').onclick=async()=>{
+ if(!incidentSelection)return;
+ const selected=incidentSelection.id,format=$('export-format').value,includeNotes=$('export-notes').checked;
+ resetIncidentExport();$('export-preview').disabled=true;
+ try {
+  const result=await api(`/api/incidents/${selected}/export`,'POST',{format,include_notes:includeNotes});
+  if(incidentSelection.id!==selected || $('export-format').value!==format || $('export-notes').checked!==includeNotes)return;
+  incidentExport=result;$('export-content').textContent=result.content;$('export-content').hidden=false;
+  $('export-summary').textContent=`${result.summary.state} · ${result.summary.activity_entries} activity entries · ${result.summary.evidence_entries} retained observations · notes ${result.summary.notes_included ? 'included' : 'excluded'}`;
+  $('export-summary').hidden=false;$('export-download').disabled=false;
+ } catch(error){$('export-error').textContent=error.message;$('export-error').hidden=false;}
+ finally{$('export-preview').disabled=false;}
+};
+$('export-download').onclick=()=>{
+ if(!incidentExport)return;
+ const url=URL.createObjectURL(new Blob([incidentExport.content],{type:incidentExport.media_type+';charset=utf-8'}));
+ const link=document.createElement('a');link.href=url;link.download=incidentExport.filename;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ toast('Report downloaded locally. Review it before sharing.');
+};
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
 setInterval(()=>{if(!document.hidden)refresh();},2000);

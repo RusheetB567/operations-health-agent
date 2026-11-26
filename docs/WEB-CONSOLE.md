@@ -53,3 +53,15 @@ Use Overview to start, stop or update a schedule. The first check runs after the
 ## Incident response
 
 Open the Incidents tab to acknowledge failures, assign an owner, add investigation notes and inspect automatic recovery. See [the Day 4.1 workflow](DAY-4.1-REPORT.md) for steps, storage limits and behaviour when services change. Incidents are created by new checks; previous runs are preserved without backfilling incidents.
+
+## Maintenance windows
+
+In Services, select Maintenance to exclude a service for 1–1,440 minutes with a required reason. Both manual and scheduled checks skip it. End the window early from maintenance history, or let it expire. The next eligible check provides a fresh health observation; existing incidents stay open until recovery is observed. Paused services stay paused. Windows persist across restarts. See [the Day 4.3 report](DAY-4.3-REPORT.md) for limits and verification.
+
+## Compare check runs
+
+In Check history, select an older baseline and a newer completed run, then select Compare runs. The results distinguish failures/recoveries from configuration revisions, maintenance boundaries and changes in which services were checked. Timing differences are shown only for comparable observations. See [the Day 4.4 report](DAY-4.4-REPORT.md).
+
+## Export incident reports
+
+Open an incident and choose Markdown or JSON under Export incident report. Notes are excluded unless selected. Preview first, then download the exact previewed snapshot. Reports contain local addresses and ownership labels, so review them before sharing. The preview and API were verified; saving a download from the in-app browser could not be confirmed. Use the local console in your normal browser to check file saving. See [the Day 4.5 report](DAY-4.5-REPORT.md).
