@@ -420,5 +420,114 @@ class ConsoleTests(unittest.TestCase):
             migrated.close()
 
 
+    def test_maintenance_validation_and_token(self):
+        identity=self.state.save_service(self.service())['id']
+        route=f'/api/services/{identity}/maintenance'
+        valid={'duration_minutes':30,'reason':'Planned migration'}
+        self.assertEqual(self.request(route,'POST',valid,{'X-Console-Token':''})[0],403)
+        for changes in ({'duration_minutes':0},{'duration_minutes':1441},{'duration_minutes':True},{'duration_minutes':1.5},{'reason':''},{'reason':'x'*301},{'reason':'bad\nreason'},{'extra':1}):
+            payload={**valid,**changes}
+            self.assertEqual(self.request(route,'POST',payload)[0],400,payload)
+        self.assertEqual(self.request('/api/services/missing/maintenance','POST',valid)[0],404)
+        self.assertEqual(self.state.maintenance_windows(),[])
+
+    def test_maintenance_excludes_manual_checks_and_health_totals(self):
+        self.finished(self.state.demo('seed')['id'])
+        service=next(s for s in self.state.services() if s['name']=='lab-worker')
+        self.state.start_maintenance(service['id'],{'duration_minutes':30,'reason':'Worker upgrade'})
+        job=self.state.start_check()
+        run=self.finished(job['id'])
+        self.assertEqual(run['report']['summary']['total'],2)
+        self.assertNotIn('lab-worker',[s['name'] for s in run['report']['services']])
+        summary=self.state.overview()['summary']
+        self.assertEqual(summary['maintenance'],1)
+        self.assertEqual(summary['monitoring'],2)
+        self.assertEqual(summary['warning'],0)
+        self.assertEqual(self.state.incidents()[0]['state'],'open')
+        self.assertIsNone(next(s for s in self.state.services() if s['id']==service['id'])['last'])
+
+    def test_maintenance_overlap_and_early_end(self):
+        identity=self.state.save_service(self.service())['id']
+        payload={'duration_minutes':30,'reason':'Planned upgrade'}
+        code,window,_=self.request(f'/api/services/{identity}/maintenance','POST',payload)
+        self.assertEqual(code,201)
+        self.assertEqual(self.request(f'/api/services/{identity}/maintenance','POST',payload)[0],409)
+        self.assertEqual(self.request('/api/checks','POST',{})[0],400)
+        self.assertEqual(self.request(f'/api/maintenance/{window["id"]}/end','POST',{})[0],200)
+        self.assertEqual(self.request(f'/api/maintenance/{window["id"]}/end','POST',{})[0],404)
+        self.assertEqual(self.state.maintenance_windows()[0]['state'],'ended')
+        self.finished(self.state.start_check()['id'])
+        self.assertEqual(self.state.services()[0]['last']['status'],'healthy')
+
+    def test_expired_maintenance_resumes_without_changing_enabled_setting(self):
+        identity=self.state.save_service(self.service())['id']
+        window=self.state.start_maintenance(identity,{'duration_minutes':1,'reason':'Short upgrade'})
+        with self.state.db() as db:
+            db.execute('UPDATE maintenance SET expires_at=? WHERE id=?',(time.time()-1,window['id']))
+        self.assertIsNone(self.state.services()[0]['maintenance'])
+        self.assertEqual(self.state.maintenance_windows()[0]['state'],'expired')
+        self.finished(self.state.start_check()['id'])
+        payload=self.service();payload['enabled']=False
+        self.state.save_service(payload,identity)
+        window=self.state.start_maintenance(identity,{'duration_minutes':1,'reason':'Paused upgrade'})
+        self.state.end_maintenance(window['id'])
+        self.assertFalse(self.state.services()[0]['enabled'])
+
+    def test_maintenance_survives_console_restart(self):
+        identity=self.state.save_service(self.service())['id']
+        self.state.start_maintenance(identity,{'duration_minutes':30,'reason':'Persistent window'})
+        restarted=ConsoleState(self.root)
+        try:
+            self.assertEqual(restarted.services()[0]['maintenance']['reason'],'Persistent window')
+            with self.assertRaises(RequestError):
+                restarted.start_check()
+        finally:
+            restarted.close()
+
+    def test_inflight_failure_cannot_open_incident_after_maintenance_cycle(self):
+        identity=self.state.save_service(self.service())['id']
+        snapshot=self.state.services()[0]
+        entered,release=threading.Event(),threading.Event()
+        def delayed_monitor(*args,**kwargs):
+            entered.set();release.wait(5)
+            return {'services':[{'name':snapshot['name'],'group':snapshot['group'],'type':'http','status':'warning','detail':{'status':'timeout'}}],'summary':{'total':1,'healthy':0,'warning':1},'status':'warning'}
+        with patch('console_app.monitor',delayed_monitor):
+            job=self.state.start_check()
+            self.assertTrue(entered.wait(3))
+            try:
+                window=self.state.start_maintenance(identity,{'duration_minutes':1,'reason':'Emergency upgrade'})
+                self.state.end_maintenance(window['id'])
+            finally:
+                release.set()
+            self.finished(job['id'])
+        self.assertEqual(self.state.incidents(),[])
+        self.assertIsNone(self.state.services()[0]['last'])
+
+    def test_maintenance_does_not_resolve_existing_incident_and_recovers_after_end(self):
+        incident=self.lab_incident()
+        snapshot=next(s for s in self.state.services() if s['id']==incident['service_id'])
+        window=self.state.start_maintenance(snapshot['id'],{'duration_minutes':30,'reason':'Repairing worker'})
+        with self.state.db() as db:
+            self.state._observe_incident(db,snapshot,{'status':'healthy'})
+        self.assertEqual(self.state.incidents()[0]['state'],'open')
+        self.state.demo_degraded=False
+        self.state.end_maintenance(window['id'])
+        self.finished(self.state.start_check()['id'])
+        self.assertEqual(self.state.incidents()[0]['resolution'],'recovered')
+
+    def test_scheduler_skips_all_services_in_maintenance_then_resumes(self):
+        self.stop_scheduler_thread()
+        identity=self.state.save_service(self.service())['id']
+        self.state.configure_schedule({'enabled':True,'interval_seconds':10})
+        window=self.state.start_maintenance(identity,{'duration_minutes':30,'reason':'Updating API'})
+        self.due_schedule()
+        self.assertEqual(self.state.runs(),[])
+        self.assertIn('maintenance',self.state.schedule_status()['last_result'])
+        self.state.end_maintenance(window['id'])
+        self.due_schedule()
+        run=self.finished(self.state.runs()[0]['id'])
+        self.assertEqual(run['source'],'scheduled')
+
+
 if __name__ == '__main__':
     unittest.main()
