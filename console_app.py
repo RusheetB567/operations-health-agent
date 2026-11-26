@@ -364,6 +364,64 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
         return [{"id": row["id"], "state": row["state"], "started_at": row["started_at"], "finished_at": row["finished_at"],
                  "report": json.loads(row["report"]) if row["report"] else None, "error": row["error"], "source": row["source"]} for row in rows]
 
+    def compare_runs(self, payload):
+        from incident_compare import compare_reports, identity, validate_report
+        if set(payload) != {"baseline_id","current_id"} or any(not isinstance(payload[k],str) or not payload[k] or len(payload[k])>64 for k in payload):
+            raise RequestError("Choose two saved runs to compare.")
+        if payload["baseline_id"] == payload["current_id"]:
+            raise RequestError("Choose two different runs.")
+        with self.db() as db:
+            records=[]
+            observations=[]
+            for key in ("baseline_id","current_id"):
+                row=db.execute("SELECT * FROM runs WHERE id=?",(payload[key],)).fetchone()
+                if not row:
+                    raise RequestError("A selected run was not found; it may have expired from history.",404)
+                if row["state"] != "completed" or not row["report"]:
+                    raise RequestError("Only completed check runs can be compared.",409)
+                try:
+                    report=validate_report(json.loads(row["report"]))
+                    items={item["service_id"]:dict(item) for item in db.execute("SELECT * FROM observations WHERE run_id=?",(row["id"],))}
+                    if len(items) != len(report["services"]):
+                        raise ValueError
+                    for item in items.values():
+                        item["result"]=json.loads(item["payload"])
+                        validate_report({"schema_version":1,"services":[item["result"]]})
+                except (ValueError,TypeError,KeyError):
+                    raise RequestError("This run lacks complete comparison metadata.",409) from None
+                records.append({"id":row["id"],"started_at":row["started_at"],"source":row["source"]})
+                observations.append(items)
+        if records[0]["started_at"] >= records[1]["started_at"]:
+            raise RequestError("The baseline must be older than the current run.")
+        before,after=observations
+        counts={key:0 for key in ("new_failure","recovered","ongoing_failure","unchanged_healthy","added_to_run","absent_from_run","configuration_changed","maintenance_boundary")}
+        rows=[]
+        for service_id in before.keys() | after.keys():
+            old,new=before.get(service_id),after.get(service_id)
+            old_result=old["result"] if old else None
+            new_result=new["result"] if new else None
+            if old is None:
+                classification="added_to_run"
+            elif new is None:
+                classification="absent_from_run"
+            elif old["revision"] != new["revision"] or identity(old_result) != identity(new_result):
+                classification="configuration_changed"
+            elif old["maintenance_version"] != new["maintenance_version"]:
+                classification="maintenance_boundary"
+            else:
+                comparison=compare_reports({"schema_version":1,"services":[old_result]}, {"schema_version":1,"services":[new_result]})
+                classification=next({"new_failures":"new_failure","recovered":"recovered","ongoing_failures":"ongoing_failure","unchanged_healthy":"unchanged_healthy","reconfigured":"configuration_changed"}[key] for key,value in comparison["counts"].items() if value)
+            def measured(result):
+                value=result["detail"].get("duration_ms") if result else None
+                return value if type(value) in (int,float) and math.isfinite(value) and value>=0 else None
+            old_ms,new_ms=measured(old_result),measured(new_result)
+            counts[classification]+=1
+            rows.append({"service_id":service_id,"name":(new_result or old_result)["name"],"classification":classification,
+                         "previous_status":old_result["status"] if old else None,"current_status":new_result["status"] if new else None,
+                         "previous_duration_ms":old_ms,"current_duration_ms":new_ms,
+                         "duration_delta_ms":round(new_ms-old_ms,2) if old_ms is not None and new_ms is not None and classification in ("new_failure","recovered","ongoing_failure","unchanged_healthy") else None})
+        return {"baseline":records[0],"current":records[1],"counts":counts,"services":sorted(rows,key=lambda item:(item["name"],item["service_id"]))}
+
     def start_check(self, ids=None, source="manual"):
         if ids is not None and (not isinstance(ids, list) or not ids or len(ids) > 50 or any(not isinstance(value, str) for value in ids)):
             raise RequestError("Select one or more service IDs.")
@@ -619,6 +677,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
             if method == "PATCH" and path == "/api/schedule":
                 return self.response(200, self.state.configure_schedule(payload))
+            if method == "POST" and path == "/api/runs/compare":
+                return self.response(200,self.state.compare_runs(payload))
             if method == "POST" and path == "/api/checks":
                 if set(payload) - {"service_ids"}:
                     raise RequestError("Unsupported check options.")

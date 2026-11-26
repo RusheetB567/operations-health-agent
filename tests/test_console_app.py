@@ -529,5 +529,100 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(run['source'],'scheduled')
 
 
+    def compare(self, baseline, current):
+        return self.request('/api/runs/compare','POST',{'baseline_id':baseline,'current_id':current})
+
+    def test_compare_runs_failure_recovery_and_ongoing(self):
+        failure=self.finished(self.state.demo('seed')['id'])
+        ongoing=self.finished(self.state.start_check()['id'])
+        self.assertEqual(self.compare(failure['id'],ongoing['id'])[1]['counts']['ongoing_failure'],1)
+        recovery=self.finished(self.state.demo('recover')['id'])
+        code,report,_=self.compare(failure['id'],recovery['id'])
+        self.assertEqual(code,200)
+        self.assertEqual(report['counts']['recovered'],1)
+        self.assertEqual(report['counts']['unchanged_healthy'],2)
+        new_failure=self.finished(self.state.demo('degrade')['id'])
+        self.assertEqual(self.compare(recovery['id'],new_failure['id'])[1]['counts']['new_failure'],1)
+
+    def test_partial_run_absence_is_not_recovery(self):
+        before=self.finished(self.state.demo('seed')['id'])
+        api=next(s for s in self.state.services() if s['name']=='lab-api')
+        after=self.finished(self.state.start_check([api['id']])['id'])
+        report=self.compare(before['id'],after['id'])[1]
+        self.assertEqual(report['counts']['absent_from_run'],2)
+        self.assertEqual(report['counts']['recovered'],0)
+        reverse=self.compare(after['id'],before['id'])
+        self.assertEqual(reverse[0],400)
+
+    def test_configuration_change_cannot_claim_recovery(self):
+        before=self.finished(self.state.demo('seed')['id'])
+        service=next(s for s in self.state.services() if s['name']=='lab-worker')
+        payload={key:service[key] for key in ('name','group','type','target','timeout','expected_status','enabled')}
+        payload['expected_status']=503
+        self.state.save_service(payload,service['id'])
+        after=self.finished(self.state.start_check()['id'])
+        report=self.compare(before['id'],after['id'])[1]
+        self.assertEqual(report['counts']['configuration_changed'],1)
+        self.assertEqual(report['counts']['recovered'],0)
+        row=next(s for s in report['services'] if s['name']=='lab-worker')
+        self.assertIsNone(row['duration_delta_ms'])
+
+    def test_maintenance_boundary_is_explicit(self):
+        before=self.finished(self.state.demo('seed')['id'])
+        service=next(s for s in self.state.services() if s['name']=='lab-worker')
+        window=self.state.start_maintenance(service['id'],{'duration_minutes':1,'reason':'Upgrade'})
+        self.state.end_maintenance(window['id'])
+        after=self.finished(self.state.demo('recover')['id'])
+        report=self.compare(before['id'],after['id'])[1]
+        self.assertEqual(report['counts']['maintenance_boundary'],1)
+        self.assertEqual(report['counts']['recovered'],0)
+
+    def test_reused_service_name_is_added_and_absent(self):
+        original=self.state.save_service(self.service())['id']
+        before=self.finished(self.state.start_check()['id'])
+        self.state.delete_service(original)
+        replacement=self.state.save_service(self.service())['id']
+        after=self.finished(self.state.start_check()['id'])
+        report=self.compare(before['id'],after['id'])[1]
+        self.assertNotEqual(original,replacement)
+        self.assertEqual(report['counts']['added_to_run'],1)
+        self.assertEqual(report['counts']['absent_from_run'],1)
+        self.assertEqual(report['counts']['unchanged_healthy'],0)
+
+    def test_comparison_input_missing_and_unfinished_runs(self):
+        self.assertEqual(self.compare('missing','other')[0],404)
+        self.assertEqual(self.compare('same','same')[0],400)
+        for payload in ({}, {'baseline_id':False,'current_id':'x'}, {'baseline_id':'a','current_id':'b','extra':1}):
+            self.assertEqual(self.request('/api/runs/compare','POST',payload)[0],400)
+        with self.state.db() as db:
+            db.execute('INSERT INTO runs(id,state,started_at) VALUES(?,?,?)',('unfinished','interrupted',now()))
+        self.assertEqual(self.compare('unfinished','other')[0],409)
+        self.assertEqual(self.request('/api/runs/compare','POST',{'baseline_id':'a','current_id':'b'},{'X-Console-Token':''})[0],403)
+
+    def test_comparison_duration_delta_and_missing_measurements(self):
+        self.state.save_service(self.service())
+        before=self.finished(self.state.start_check()['id'])
+        after=self.finished(self.state.start_check()['id'])
+        with self.state.db() as db:
+            for identity,value in ((before['id'],100),(after['id'],125.25)):
+                row=db.execute('SELECT payload FROM observations WHERE run_id=?',(identity,)).fetchone()
+                payload=json.loads(row['payload']);payload['detail']['duration_ms']=value
+                db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),identity))
+        report=self.compare(before['id'],after['id'])[1]
+        self.assertEqual(report['services'][0]['duration_delta_ms'],25.25)
+        with self.state.db() as db:
+            payload['detail']['duration_ms']=True
+            db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),after['id']))
+        self.assertIsNone(self.compare(before['id'],after['id'])[1]['services'][0]['duration_delta_ms'])
+
+    def test_incomplete_comparison_metadata_rejected(self):
+        self.state.save_service(self.service())
+        before=self.finished(self.state.start_check()['id'])
+        after=self.finished(self.state.start_check()['id'])
+        with self.state.db() as db:
+            db.execute('DELETE FROM observations WHERE run_id=?',(before['id'],))
+        self.assertEqual(self.compare(before['id'],after['id'])[0],409)
+
+
 if __name__ == '__main__':
     unittest.main()

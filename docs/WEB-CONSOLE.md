@@ -57,3 +57,7 @@ Open the Incidents tab to acknowledge failures, assign an owner, add investigati
 ## Maintenance windows
 
 In Services, select Maintenance to exclude a service for 1–1,440 minutes with a required reason. Both manual and scheduled checks skip it. End the window early from maintenance history, or let it expire. The next eligible check provides a fresh health observation; existing incidents stay open until recovery is observed. Paused services stay paused. Windows persist across restarts. See [the Day 4.3 report](DAY-4.3-REPORT.md) for limits and verification.
+
+## Compare check runs
+
+In Check history, select an older baseline and a newer completed run, then select Compare runs. The results distinguish failures/recoveries from configuration revisions, maintenance boundaries and changes in which services were checked. Timing differences are shown only for comparable observations. See [the Day 4.4 report](DAY-4.4-REPORT.md).

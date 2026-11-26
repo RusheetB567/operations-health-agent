@@ -45,6 +45,7 @@ function render() {
  renderIncidents();
  renderSchedule();
  renderMaintenance();
+ renderRunChoices();
  $('nav-service-count').textContent=s.total;
  $('metric-enabled').textContent=s.enabled; $('metric-healthy').textContent=s.healthy; $('metric-warning').textContent=s.warning;
  $('metric-enabled-caption').textContent=`${s.total-s.enabled} paused · ${s.maintenance} in maintenance · ${s.unchecked} unchecked`;
@@ -242,6 +243,29 @@ $('maintenance-form').onsubmit=async event=>{
   $('maintenance-dialog').close();await refresh();toast('Maintenance started. Existing incidents stay open.');
  }catch(error){$('maintenance-error').textContent=error.message;$('maintenance-error').hidden=false;}
  finally{$('maintenance-save').disabled=false;}
+};
+const comparisonLabels={new_failure:'New failure',recovered:'Recovered',ongoing_failure:'Ongoing failure',unchanged_healthy:'Still healthy',added_to_run:'Added to run',absent_from_run:'Absent from run',configuration_changed:'Configuration changed',maintenance_boundary:'Maintenance boundary'};
+let comparisonBusy=false;
+function renderRunChoices() {
+ const completed=model.runs.filter(r=>r.state==='completed');
+ for(const id of ['compare-baseline','compare-current']) {
+  const select=$(id),previous=select.value;
+  if(document.activeElement===select)continue;
+  select.innerHTML=completed.map(r=>`<option value="${r.id}">${date(r.started_at)} · ${esc(r.source || 'manual')} · ${r.report.summary.healthy}/${r.report.summary.total} healthy · ${r.id.slice(0,6)}</option>`).join('');
+  if(completed.some(r=>r.id===previous))select.value=previous;
+  else select.value=(id==='compare-baseline' ? completed[1] : completed[0])?.id || '';
+ }
+ $('compare-submit').disabled=comparisonBusy || completed.length<2;
+ if(completed.length<2 && !$('compare-results').hasChildNodes())$('compare-results').innerHTML=empty('Two completed runs are needed','Run checks before and after a change, then compare the observations.');
+}
+$('compare-form').onsubmit=async event=>{
+ event.preventDefault();comparisonBusy=true;$('compare-submit').disabled=true;$('compare-error').hidden=true;
+ try {
+  const report=await api('/api/runs/compare','POST',{baseline_id:$('compare-baseline').value,current_id:$('compare-current').value});
+  const changes=Object.entries(report.counts).filter(([,count])=>count>0);
+  $('compare-results').innerHTML=`<div class="comparison-summary">${changes.map(([key,count])=>`<div><strong>${count}</strong><span>${comparisonLabels[key]}</span></div>`).join('')}</div><p class="small-note left comparison-caption">Baseline ${date(report.baseline.started_at)} compared with ${date(report.current.started_at)}. Absent services may be paused, in maintenance or outside a partial check. Duration differences are observations, not a performance guarantee.</p><div class="table-wrap"><table><thead><tr><th>Service</th><th>Change</th><th>Before</th><th>After</th><th>Duration difference</th></tr></thead><tbody>${report.services.map(s=>`<tr><td>${esc(s.name)}</td><td>${comparisonLabels[s.classification]}</td><td>${s.previous_status ? badge(s.previous_status) : 'Not observed'}</td><td>${s.current_status ? badge(s.current_status) : 'Not observed'}</td><td class="mono">${s.duration_delta_ms===null ? 'Not comparable' : `${s.duration_delta_ms>0 ? '+' : ''}${s.duration_delta_ms} ms`}</td></tr>`).join('')}</tbody></table></div>`;
+ }catch(error){$('compare-error').textContent=error.message;$('compare-error').hidden=false;$('compare-results').replaceChildren();}
+ finally{comparisonBusy=false;renderRunChoices();}
 };
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
