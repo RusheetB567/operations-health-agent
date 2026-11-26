@@ -271,7 +271,7 @@ $('compare-form').onsubmit=async event=>{
 };
 let incidentExport=null;
 function resetIncidentExport() {
- incidentExport=null;$('export-download').disabled=true;$('export-content').hidden=true;$('export-content').textContent='';$('export-summary').hidden=true;$('export-error').hidden=true;
+ incidentExport=null;$('export-save-local').disabled=true;$('export-saved').hidden=true;$('export-download').disabled=true;$('export-content').hidden=true;$('export-content').textContent='';$('export-summary').hidden=true;$('export-error').hidden=true;
 }
 $('export-format').onchange=resetIncidentExport;
 $('export-notes').onchange=resetIncidentExport;
@@ -284,9 +284,20 @@ $('export-preview').onclick=async()=>{
   if(incidentSelection.id!==selected || $('export-format').value!==format || $('export-notes').checked!==includeNotes)return;
   incidentExport=result;$('export-content').textContent=result.content;$('export-content').hidden=false;
   $('export-summary').textContent=`${result.summary.state} · ${result.summary.activity_entries} activity entries · ${result.summary.evidence_entries} retained observations · notes ${result.summary.notes_included ? 'included' : 'excluded'}`;
-  $('export-summary').hidden=false;$('export-download').disabled=false;
+  $('export-summary').hidden=false;$('export-download').disabled=false;$('export-save-local').disabled=false;
  } catch(error){$('export-error').textContent=error.message;$('export-error').hidden=false;}
  finally{$('export-preview').disabled=false;}
+};
+$('export-save-local').onclick=async()=>{
+ if(!incidentExport)return;
+ const preview=incidentExport.preview_id;$('export-save-local').disabled=true;$('export-error').hidden=true;
+ try {
+  const saved=await api(`/api/exports/${preview}/save`,'POST',{});
+  if(incidentExport?.preview_id!==preview)return;
+  $('export-saved').textContent=`Saved: ${saved.path} · ${saved.bytes} bytes · SHA-256: ${saved.sha256}`;$('export-saved').hidden=false;
+  toast('Previewed report saved in reports/incident-exports.');
+ }catch(error){$('export-error').textContent=error.message;$('export-error').hidden=false;}
+ finally{if(incidentExport?.preview_id===preview)$('export-save-local').disabled=false;}
 };
 $('export-download').onclick=()=>{
  if(!incidentExport)return;
