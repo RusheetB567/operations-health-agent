@@ -10,7 +10,7 @@ Diagnose host resource pressure and application availability from a local comman
 - Stores final host reports in SQLite with record-count retention.
 - Summarises JSONL log severity without copying raw log fields.
 
-The tools run when invoked and stop afterward. They do not install background monitoring, upload reports or repair applications automatically.
+The diagnostic commands run when invoked and stop afterward. The optional console runs until its terminal is stopped, with opt-in scheduled service checks. They do not install background monitoring, upload reports or repair applications automatically.
 
 ## Start here
 
@@ -94,3 +94,7 @@ Combine monitoring observations, privacy-safe log triage and the incident timeli
 ```
 
 The synthetic example returns warning status while producing a complete integrity-verified pack. Raw logs are not copied into it.
+
+## SignalDesk browser console
+
+Double-click `Start-SignalDesk.cmd` to manage local services, investigate incidents and run scheduled HTTP/TCP checks in the browser. Read [the console guide](docs/WEB-CONSOLE.md), [incident workflow](docs/DAY-4.1-REPORT.md), and [scheduled-check workflow](docs/DAY-4.2-REPORT.md).

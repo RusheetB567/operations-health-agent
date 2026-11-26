@@ -1,0 +1,51 @@
+# SignalDesk local operations console
+
+SignalDesk connects the existing diagnostics to a usable browser workspace. It runs on this device and supports local HTTP and TCP services.
+
+## Launch
+
+Double-click `Start-SignalDesk.cmd` in the repository, or run:
+
+```powershell
+.\.venv\Scripts\python.exe console_app.py --open
+```
+
+Open <http://127.0.0.1:8765>. Leave the terminal open; press Ctrl+C there to stop. If the port is occupied, use `--port 8766`. A fresh checkout needs Python 3.11+, a `.venv`, and `pip install -r requirements.txt` first.
+
+## Try the complete workflow
+
+1. Select **Start local lab**. Three endpoints are checked using the existing probe implementations. The worker deliberately returns HTTP 503: expect two healthy services and one warning.
+2. Select **Recover lab worker**. A new check should show three healthy services. Open **Check history** to inspect both observations.
+3. Under **Services**, add an actual loopback endpoint. Edit its expected status or target, pause it, or check it individually. Changing its configuration invalidates its previous current-health observation while preserving history.
+4. Under **Log triage**, load the sample, paste JSONL, or select a local file. Analyse it to see categories and private recurring-pattern fingerprints. The input field is cleared after success. The backend removes its temporary input file and saves only the summary.
+5. Under **Evidence library**, verify an existing investigation pack and open its sandboxed timeline. Packs are read from `reports/investigations/run-*`; they are not modified by the console.
+
+## Storage and limits
+
+The SQLite database is `reports/console/console.sqlite3`, covered by the repository's existing generated-report ignore rule. Service settings and observations persist across restarts. Queued/running jobs interrupted by a restart are marked interrupted rather than reported as successful.
+
+- Up to 50 services; at most one check run at a time, with four concurrent probes.
+- At most 10 seconds per probe. Scheduled checks are opt-in at intervals of 10–3,600 seconds; no automatic repairs.
+- Keep 200 runs; display the latest 30.
+- Keep 20 triage summaries; accept up to 262,144 input characters, scan at most 10,000 lines and group up to 100 patterns. The upload picker caps file size at 256 KiB.
+- List up to 30 investigation packs. Verification results are session-only and must be rerun after restart or external changes.
+
+Health cards show the latest completed observation for each enabled service. They are snapshots, not continuous monitoring or uptime percentages. P95 is calculated from those observations and includes probe process overhead. Lab endpoints exist only while the console is running; start the lab again after changing the console port.
+
+## Local access boundary
+
+The server binds only to `127.0.0.1` and accepts loopback targets. It checks Host and Origin, requires a fresh per-process token for mutations, rejects cross-origin API access, bounds JSON requests, and escapes user values in the UI. Timeline pages receive a restrictive sandbox policy. No CDN assets or telemetry are loaded.
+
+This is a local development console, without user accounts or remote agent authentication. Do not expose it through a tunnel or public reverse proxy. Authenticated multi-user access and remote collectors need a separate implementation before hosted use.
+
+## Validation
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+The console integration tests exercise actual HTTP requests, failure/recovery probes, CRUD, configuration revisions, persistence, interrupted jobs, concurrent-run rejection, request protection, raw-log privacy, and evidence sandboxing.
+
+## Scheduled checks
+
+Use Overview to start, stop or update a schedule. The first check runs after the selected interval. Busy intervals are skipped and paused services are excluded. Check history labels each run as manual or scheduled. The interval persists, but scheduling always starts stopped after a console restart. Closing the browser does not stop an enabled schedule; stop it in Overview or close the console terminal. See [the Day 4.2 report](DAY-4.2-REPORT.md).
