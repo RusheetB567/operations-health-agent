@@ -49,3 +49,7 @@ The console integration tests exercise actual HTTP requests, failure/recovery pr
 ## Scheduled checks
 
 Use Overview to start, stop or update a schedule. The first check runs after the selected interval. Busy intervals are skipped and paused services are excluded. Check history labels each run as manual or scheduled. The interval persists, but scheduling always starts stopped after a console restart. Closing the browser does not stop an enabled schedule; stop it in Overview or close the console terminal. See [the Day 4.2 report](DAY-4.2-REPORT.md).
+
+## Incident response
+
+Open the Incidents tab to acknowledge failures, assign an owner, add investigation notes and inspect automatic recovery. See [the Day 4.1 workflow](DAY-4.1-REPORT.md) for steps, storage limits and behaviour when services change. Incidents are created by new checks; previous runs are preserved without backfilling incidents.

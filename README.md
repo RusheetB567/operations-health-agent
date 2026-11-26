@@ -98,3 +98,5 @@ The synthetic example returns warning status while producing a complete integrit
 ## SignalDesk browser console
 
 Double-click `Start-SignalDesk.cmd` to manage local services, investigate incidents and run scheduled HTTP/TCP checks in the browser. Read [the console guide](docs/WEB-CONSOLE.md), [incident workflow](docs/DAY-4.1-REPORT.md), and [scheduled-check workflow](docs/DAY-4.2-REPORT.md).
+
+Read [the original Day 4 console report](docs/DAY-FOUR-REPORT.md) for the initial application workflow.
