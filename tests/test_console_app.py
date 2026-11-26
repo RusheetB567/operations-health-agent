@@ -689,5 +689,49 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(report['scope']['retained_history_only'])
 
 
+    def test_local_export_save_exact_preview_and_checksum(self):
+        import hashlib
+        incident=self.lab_incident()
+        preview=self.state.export_incident(incident['id'],{'format':'markdown','include_notes':False})
+        self.state.update_incident(incident['id'],{'version':incident['version'],'action':'note','note':'Newer note after preview'})
+        code,saved,_=self.request(f'/api/exports/{preview["preview_id"]}/save','POST',{})
+        self.assertEqual(code,200)
+        destination=self.root/saved['path']
+        self.assertEqual(destination.read_bytes(),preview['content'].encode('utf-8'))
+        self.assertEqual(saved['sha256'],hashlib.sha256(destination.read_bytes()).hexdigest())
+        self.assertEqual(saved['bytes'],len(destination.read_bytes()))
+        self.assertNotIn('Newer note after preview',destination.read_text(encoding='utf-8'))
+
+    def test_local_export_save_is_idempotent_and_preserves_earlier_files(self):
+        incident=self.lab_incident()
+        payload={'format':'json','include_notes':False}
+        first=self.state.export_incident(incident['id'],payload)
+        saved=self.state.save_incident_export(first['preview_id'],{})
+        self.assertEqual(self.state.save_incident_export(first['preview_id'],{}),saved)
+        second=self.state.export_incident(incident['id'],payload)
+        other=self.state.save_incident_export(second['preview_id'],{})
+        self.assertNotEqual(other['path'],saved['path'])
+        self.assertEqual(len(list((self.root/'reports'/'incident-exports').glob('*.json'))),2)
+
+    def test_local_export_save_validation_and_expiry(self):
+        incident=self.lab_incident()
+        preview=self.state.export_incident(incident['id'],{'format':'json','include_notes':False})
+        route=f'/api/exports/{preview["preview_id"]}/save'
+        self.assertEqual(self.request(route,'POST',{}, {'X-Console-Token':''})[0],403)
+        self.assertEqual(self.request(route,'POST',{'path':'outside.json','content':'replacement'})[0],400)
+        self.state.export_previews[preview['preview_id']]['expires']=time.monotonic()-1
+        self.assertEqual(self.request(route,'POST',{})[0],410)
+        self.assertFalse((self.root/'reports'/'incident-exports').exists())
+
+    def test_export_preview_cache_is_bounded(self):
+        incident=self.lab_incident()
+        original=self.state.export_incident(incident['id'],{'format':'json','include_notes':False})
+        for _ in range(8):
+            self.state.export_incident(incident['id'],{'format':'json','include_notes':False})
+        self.assertEqual(len(self.state.export_previews),8)
+        with self.assertRaises(RequestError):
+            self.state.save_incident_export(original['preview_id'],{})
+
+
 if __name__ == '__main__':
     unittest.main()

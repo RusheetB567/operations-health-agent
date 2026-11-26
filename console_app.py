@@ -101,6 +101,7 @@ class ConsoleState:
         self.schedule_stop = threading.Event()
         self.demo_degraded = True
         self.evidence_verifications = {}
+        self.export_previews = {}
         with self.db() as db:
             db.executescript('''
 CREATE TABLE IF NOT EXISTS services(id TEXT PRIMARY KEY,name TEXT UNIQUE NOT NULL,group_name TEXT NOT NULL,protocol TEXT NOT NULL,target TEXT NOT NULL,timeout REAL NOT NULL,expected_status INTEGER NOT NULL,enabled INTEGER NOT NULL,revision INTEGER NOT NULL,is_demo INTEGER NOT NULL,created_at TEXT NOT NULL);
@@ -356,8 +357,53 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 lines.extend([literal(json.dumps(item,ensure_ascii=False)),""])
             content="\n".join(lines)
             extension,media_type="md","text/markdown"
-        return {"filename":f"incident-{identity}.{extension}","media_type":media_type,"content":content,
+        result={"filename":f"incident-{identity}.{extension}","media_type":media_type,"content":content,
                 "summary":{"state":incident["state"],"activity_entries":len(events),"evidence_entries":len(evidence),"notes_included":payload["include_notes"]}}
+        with self.lock:
+            preview_id=uuid.uuid4().hex
+            self.export_previews={key:value for key,value in self.export_previews.items() if value["expires"]>time.monotonic()}
+            while len(self.export_previews)>=8:
+                self.export_previews.pop(next(iter(self.export_previews)))
+            self.export_previews[preview_id]={"expires":time.monotonic()+900,"report":result.copy(),"saved":None}
+            result["preview_id"]=preview_id
+        return result
+
+    def save_incident_export(self, preview_id, payload):
+        import hashlib
+        import os
+        if payload:
+            raise RequestError("Saving uses the previewed report; no file paths or content are accepted.")
+        with self.lock:
+            preview=self.export_previews.get(preview_id)
+            if not preview or preview["expires"]<=time.monotonic():
+                raise RequestError("This preview expired. Preview the report again before saving.",410)
+            if preview["saved"]:
+                return preview["saved"]
+            directory=self.root/"reports"/"incident-exports"
+            if (self.root/"reports").is_symlink() or directory.is_symlink() or not directory.resolve().is_relative_to(self.root):
+                raise RequestError("The local report folder must stay inside this repository.",409)
+            directory.mkdir(parents=True,exist_ok=True)
+            # A unique name per preview preserves earlier reports. Repeated saves are idempotent.
+            name=Path(preview["report"]["filename"])
+            target=directory/(name.stem+"-"+preview_id+name.suffix)
+            if target.exists() or target.is_symlink():
+                raise RequestError("The report path is already occupied. Create a fresh preview.",409)
+            content=preview["report"]["content"]
+            temporary=None
+            try:
+                with tempfile.NamedTemporaryFile(mode="wb",dir=directory,prefix=".incident-",delete=False) as stream:
+                    temporary=Path(stream.name)
+                    stream.write(content.encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.replace(target)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            data=target.read_bytes()
+            result={"path":target.relative_to(self.root).as_posix(),"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()}
+            preview["saved"]=result
+            return result
 
     def update_incident(self, identity, payload):
         if set(payload) - {"version", "action", "owner", "note"} or type(payload.get("version")) is not int:
@@ -722,6 +768,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
             if method == "PATCH" and path == "/api/schedule":
                 return self.response(200, self.state.configure_schedule(payload))
+            if method == "POST" and path.startswith("/api/exports/") and path.endswith("/save"):
+                return self.response(200,self.state.save_incident_export(path.split("/")[3],payload))
             if method == "POST" and path.startswith("/api/incidents/") and path.endswith("/export"):
                 return self.response(200,self.state.export_incident(path.split("/")[3],payload))
             if method == "POST" and path == "/api/runs/compare":

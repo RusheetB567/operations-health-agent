@@ -65,3 +65,7 @@ In Check history, select an older baseline and a newer completed run, then selec
 ## Export incident reports
 
 Open an incident and choose Markdown or JSON under Export incident report. Notes are excluded unless selected. Preview first, then download the exact previewed snapshot. Reports contain local addresses and ownership labels, so review them before sharing. The preview and API were verified; saving a download from the in-app browser could not be confirmed. Use the local console in your normal browser to check file saving. See [the Day 4.5 report](DAY-4.5-REPORT.md).
+
+## Save a local report copy
+
+After previewing an incident report, select Save local copy. The exact preview is saved atomically under reports/incident-exports, and its path, byte count and checksum appear in the dialog. Previews expire after 15 minutes; only the latest eight remain available. Re-preview if needed. Existing saved files are preserved and ignored by Git. This flow was verified independently of browser downloading. See [Day 4.6](DAY-4.6-REPORT.md) and [the Day 4 wrap-up](DAY-FOUR-WRAP-UP.md).
