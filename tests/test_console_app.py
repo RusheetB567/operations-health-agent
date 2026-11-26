@@ -624,5 +624,70 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(self.compare(before['id'],after['id'])[0],409)
 
 
+    def test_export_includes_recovery_and_full_activity(self):
+        incident=self.lab_incident()
+        self.state.update_incident(incident['id'],{'version':incident['version'],'action':'acknowledge','owner':'Local operator','note':'Checked worker dependencies.'})
+        self.finished(self.state.demo('recover')['id'])
+        code,result,_=self.request(f'/api/incidents/{incident["id"]}/export','POST',{'format':'json','include_notes':True})
+        self.assertEqual(code,200)
+        report=json.loads(result['content'])
+        self.assertEqual(report['incident']['resolution'],'recovered')
+        self.assertEqual(report['incident']['owner'],'Local operator')
+        self.assertEqual(len(report['evidence']),2)
+        self.assertEqual(report['evidence'][-1]['status'],'healthy')
+        self.assertEqual(report['evidence'][-1]['http_status'],200)
+        self.assertIn('note',[event['kind'] for event in report['activity']])
+        self.assertTrue(result['filename'].endswith('.json'))
+
+    def test_export_omits_notes_and_arbitrary_probe_fields(self):
+        incident=self.lab_incident()
+        marker='PRIVATE_INVESTIGATION_CONTENT'
+        self.state.update_incident(incident['id'],{'version':incident['version'],'action':'note','note':marker})
+        with self.state.db() as db:
+            row=db.execute('SELECT run_id,payload FROM observations WHERE service_id=?',(incident['service_id'],)).fetchone()
+            payload=json.loads(row['payload']);payload['detail']['raw_log']=marker
+            db.execute('UPDATE observations SET payload=? WHERE run_id=? AND service_id=?',(json.dumps(payload),row['run_id'],incident['service_id']))
+        for format in ('json','markdown'):
+            result=self.state.export_incident(incident['id'],{'format':format,'include_notes':False})
+            self.assertNotIn(marker,result['content'])
+            self.assertFalse(result['summary']['notes_included'])
+        included=self.state.export_incident(incident['id'],{'format':'json','include_notes':True})
+        self.assertIn(marker,included['content'])
+        self.assertNotIn('raw_log',included['content'])
+
+    def test_markdown_export_keeps_notes_literal(self):
+        incident=self.lab_incident()
+        note='<script>alert(1)</script>\n# Invented report heading\n[link](https://example.test)'
+        self.state.update_incident(incident['id'],{'version':incident['version'],'action':'note','note':note})
+        result=self.state.export_incident(incident['id'],{'format':'markdown','include_notes':True})
+        self.assertIn('    <script>alert(1)</script>',result['content'])
+        self.assertIn('    # Invented report heading',result['content'])
+        self.assertNotIn('\n# Invented report heading',result['content'])
+        self.assertEqual(result['media_type'],'text/markdown')
+
+    def test_export_validation_missing_incident_and_token(self):
+        incident=self.lab_incident()
+        route=f'/api/incidents/{incident["id"]}/export'
+        for payload in ({},{'format':'html','include_notes':False},{'format':'json','include_notes':1},{'format':'json','include_notes':False,'extra':True}):
+            self.assertEqual(self.request(route,'POST',payload)[0],400)
+        valid={'format':'json','include_notes':False}
+        self.assertEqual(self.request(route,'POST',valid,{'X-Console-Token':''})[0],403)
+        self.assertEqual(self.request('/api/incidents/missing/export','POST',valid)[0],404)
+
+    def test_export_bounds_retained_evidence_and_flags_truncation(self):
+        incident=self.lab_incident()
+        sample={'status':'warning','detail':{'status':'timeout','duration_ms':3}}
+        with self.state.db() as db:
+            for index in range(101):
+                run_id='export-sample-'+str(index)
+                db.execute("INSERT INTO runs(id,state,started_at,finished_at,source) VALUES(?,'completed',?,?,'manual')",(run_id,now(),now()))
+                db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,?,?,0)',(run_id,incident['service_id'],incident['revision'],json.dumps(sample)))
+        result=self.state.export_incident(incident['id'],{'format':'json','include_notes':False})
+        report=json.loads(result['content'])
+        self.assertEqual(len(report['evidence']),100)
+        self.assertTrue(report['scope']['evidence_truncated'])
+        self.assertTrue(report['scope']['retained_history_only'])
+
+
 if __name__ == '__main__':
     unittest.main()

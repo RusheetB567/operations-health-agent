@@ -176,6 +176,8 @@ function renderIncidents() {
 function openIncident(identity) {
  const incident=model.incidents.find(i=>i.id===identity); if(!incident)return;
  incidentSelection={id:identity,version:incident.version};
+ $('export-notes').checked=false;
+ resetIncidentExport();
  $('incident-title').textContent=incident.service_name;
  $('incident-summary').innerHTML=`<div class="run-detail-summary">${badge(incident.state)}<span>Opened ${date(incident.opened_at)}</span></div><p class="mono incident-target">${esc(incident.target)}</p><p>${incident.failures} failed checks observed${incident.resolution ? ` · ${esc(incident.resolution.replaceAll('_',' '))} at ${date(incident.resolved_at)}` : ''}</p>`;
  $('incident-owner').value=incident.owner; $('incident-note').value=''; $('incident-form-error').hidden=true;
@@ -266,6 +268,31 @@ $('compare-form').onsubmit=async event=>{
   $('compare-results').innerHTML=`<div class="comparison-summary">${changes.map(([key,count])=>`<div><strong>${count}</strong><span>${comparisonLabels[key]}</span></div>`).join('')}</div><p class="small-note left comparison-caption">Baseline ${date(report.baseline.started_at)} compared with ${date(report.current.started_at)}. Absent services may be paused, in maintenance or outside a partial check. Duration differences are observations, not a performance guarantee.</p><div class="table-wrap"><table><thead><tr><th>Service</th><th>Change</th><th>Before</th><th>After</th><th>Duration difference</th></tr></thead><tbody>${report.services.map(s=>`<tr><td>${esc(s.name)}</td><td>${comparisonLabels[s.classification]}</td><td>${s.previous_status ? badge(s.previous_status) : 'Not observed'}</td><td>${s.current_status ? badge(s.current_status) : 'Not observed'}</td><td class="mono">${s.duration_delta_ms===null ? 'Not comparable' : `${s.duration_delta_ms>0 ? '+' : ''}${s.duration_delta_ms} ms`}</td></tr>`).join('')}</tbody></table></div>`;
  }catch(error){$('compare-error').textContent=error.message;$('compare-error').hidden=false;$('compare-results').replaceChildren();}
  finally{comparisonBusy=false;renderRunChoices();}
+};
+let incidentExport=null;
+function resetIncidentExport() {
+ incidentExport=null;$('export-download').disabled=true;$('export-content').hidden=true;$('export-content').textContent='';$('export-summary').hidden=true;$('export-error').hidden=true;
+}
+$('export-format').onchange=resetIncidentExport;
+$('export-notes').onchange=resetIncidentExport;
+$('export-preview').onclick=async()=>{
+ if(!incidentSelection)return;
+ const selected=incidentSelection.id,format=$('export-format').value,includeNotes=$('export-notes').checked;
+ resetIncidentExport();$('export-preview').disabled=true;
+ try {
+  const result=await api(`/api/incidents/${selected}/export`,'POST',{format,include_notes:includeNotes});
+  if(incidentSelection.id!==selected || $('export-format').value!==format || $('export-notes').checked!==includeNotes)return;
+  incidentExport=result;$('export-content').textContent=result.content;$('export-content').hidden=false;
+  $('export-summary').textContent=`${result.summary.state} · ${result.summary.activity_entries} activity entries · ${result.summary.evidence_entries} retained observations · notes ${result.summary.notes_included ? 'included' : 'excluded'}`;
+  $('export-summary').hidden=false;$('export-download').disabled=false;
+ } catch(error){$('export-error').textContent=error.message;$('export-error').hidden=false;}
+ finally{$('export-preview').disabled=false;}
+};
+$('export-download').onclick=()=>{
+ if(!incidentExport)return;
+ const url=URL.createObjectURL(new Blob([incidentExport.content],{type:incidentExport.media_type+';charset=utf-8'}));
+ const link=document.createElement('a');link.href=url;link.download=incidentExport.filename;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ toast('Report downloaded locally. Review it before sharing.');
 };
 window.addEventListener('hashchange',navigate);
 navigate();refresh();

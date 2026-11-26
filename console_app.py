@@ -314,6 +314,51 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 result.append(item)
             return result
 
+    def export_incident(self, identity, payload):
+        if set(payload) != {"format","include_notes"} or payload.get("format") not in ("json","markdown") or type(payload.get("include_notes")) is not bool:
+            raise RequestError("Choose JSON or Markdown and whether to include investigation notes.")
+        with self.db() as db:
+            db.execute("BEGIN")  # One consistent snapshot across incident, activity and retained evidence.
+            row=db.execute("SELECT * FROM incidents WHERE id=?",(identity,)).fetchone()
+            if not row:
+                raise RequestError("Incident not found; it may have expired from history.",404)
+            incident=dict(row)
+            events=[dict(item) for item in db.execute("SELECT kind,created_at,detail FROM incident_events WHERE incident_id=? ORDER BY id LIMIT 200",(identity,)) if payload["include_notes"] or item["kind"] != "note"]
+            records=db.execute("SELECT r.id,r.finished_at,r.source,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND r.state='completed' AND r.finished_at>=? AND r.started_at<=? ORDER BY r.finished_at DESC LIMIT 101",(incident["service_id"],incident["revision"],incident["opened_at"],incident["resolved_at"] or now())).fetchall()
+        evidence=[]
+        for item in reversed(records[:100]):
+            result=json.loads(item["payload"])
+            detail=result.get("detail",{})
+            measured=detail.get("duration_ms")
+            evidence.append({"run_id":item["id"],"finished_at":item["finished_at"],"source":item["source"],"status":result.get("status"),
+                             "probe_status":detail.get("status"),"http_status":detail.get("http_status"),
+                             "duration_ms":measured if type(measured) in (int,float) and math.isfinite(measured) and measured>=0 else None})
+        report={"schema_version":1,"report_type":"incident-handoff","generated_at":now(),
+                "incident":{key:incident[key] for key in ("id","service_name","target","revision","state","owner","opened_at","last_seen","resolved_at","resolution","failures","version")},
+                "activity":events,"evidence":evidence,
+                "scope":{"notes_included":payload["include_notes"],"evidence_limit":100,"evidence_truncated":len(records)>100,
+                         "retained_history_only":True,"notice":"Evidence contains retained observations for this service revision during the incident window. Older runs may have expired. Observations do not establish a root cause. Owner is a local label, not an authenticated identity."}}
+        if payload["format"] == "json":
+            content=json.dumps(report,indent=2,ensure_ascii=False)+"\n"
+            extension,media_type="json","application/json"
+        else:
+            # Indented blocks keep user-authored notes/labels as literal text, including HTML/Markdown.
+            def literal(value):
+                return "\n".join("    "+line for line in str(value if value is not None else "Not recorded").splitlines()) or "    Not recorded"
+            lines=["# Incident handoff", "", "Generated: "+report["generated_at"], ""]
+            for label,key in (("Incident ID","id"),("Service","service_name"),("Target","target"),("State","state"),("Owner","owner"),("Opened","opened_at"),("Last warning","last_seen"),("Resolved","resolved_at"),("Resolution","resolution"),("Observed failed checks","failures")):
+                lines.extend(["## "+label,"",literal(incident[key]),""])
+            lines.extend(["## Scope","",report["scope"]["notice"],"", "Investigation notes included: "+str(payload["include_notes"]), "", "## Activity", ""])
+            for event in events:
+                lines.extend([event["created_at"]+" — "+event["kind"],"",literal(event["detail"]),""])
+            lines.extend(["## Retained check evidence","",f"Included {len(evidence)} observations; limit 100. Truncated: {len(records)>100}.",""])
+            for item in evidence:
+                lines.extend([literal(json.dumps(item,ensure_ascii=False)),""])
+            content="\n".join(lines)
+            extension,media_type="md","text/markdown"
+        return {"filename":f"incident-{identity}.{extension}","media_type":media_type,"content":content,
+                "summary":{"state":incident["state"],"activity_entries":len(events),"evidence_entries":len(evidence),"notes_included":payload["include_notes"]}}
+
     def update_incident(self, identity, payload):
         if set(payload) - {"version", "action", "owner", "note"} or type(payload.get("version")) is not int:
             raise RequestError("Send the current incident version and supported fields.")
@@ -677,6 +722,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
             if method == "PATCH" and path == "/api/schedule":
                 return self.response(200, self.state.configure_schedule(payload))
+            if method == "POST" and path.startswith("/api/incidents/") and path.endswith("/export"):
+                return self.response(200,self.state.export_incident(path.split("/")[3],payload))
             if method == "POST" and path == "/api/runs/compare":
                 return self.response(200,self.state.compare_runs(payload))
             if method == "POST" and path == "/api/checks":
