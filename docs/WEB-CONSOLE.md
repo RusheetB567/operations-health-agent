@@ -25,7 +25,7 @@ Open <http://127.0.0.1:8765>. Leave the terminal open; press Ctrl+C there to sto
 The SQLite database is `reports/console/console.sqlite3`, covered by the repository's existing generated-report ignore rule. Service settings and observations persist across restarts. Queued/running jobs interrupted by a restart are marked interrupted rather than reported as successful.
 
 - Up to 50 services; at most one check run at a time, with four concurrent probes.
-- At most 10 seconds per probe; no scheduled scans or automatic repairs.
+- At most 10 seconds per probe. Scheduled checks are opt-in at intervals of 10–3,600 seconds; no automatic repairs.
 - Keep 200 runs; display the latest 30.
 - Keep 20 triage summaries; accept up to 262,144 input characters, scan at most 10,000 lines and group up to 100 patterns. The upload picker caps file size at 256 KiB.
 - List up to 30 investigation packs. Verification results are session-only and must be rerun after restart or external changes.
@@ -45,6 +45,10 @@ This is a local development console, without user accounts or remote agent authe
 ```
 
 The console integration tests exercise actual HTTP requests, failure/recovery probes, CRUD, configuration revisions, persistence, interrupted jobs, concurrent-run rejection, request protection, raw-log privacy, and evidence sandboxing.
+
+## Scheduled checks
+
+Use Overview to start, stop or update a schedule. The first check runs after the selected interval. Busy intervals are skipped and paused services are excluded. Check history labels each run as manual or scheduled. The interval persists, but scheduling always starts stopped after a console restart. Closing the browser does not stop an enabled schedule; stop it in Overview or close the console terminal. See [the Day 4.2 report](DAY-4.2-REPORT.md).
 
 ## Incident response
 

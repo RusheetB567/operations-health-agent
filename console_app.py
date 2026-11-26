@@ -94,6 +94,11 @@ class ConsoleState:
         self.port = 0
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="console-check")
         self.lock = threading.RLock()
+        self.closing = False
+        self.schedule_enabled = False
+        self.schedule_due = None
+        self.schedule_result = "Not started"
+        self.schedule_stop = threading.Event()
         self.demo_degraded = True
         self.evidence_verifications = {}
         with self.db() as db:
@@ -104,9 +109,64 @@ CREATE TABLE IF NOT EXISTS observations(run_id TEXT REFERENCES runs(id) ON DELET
 CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY,service_id TEXT NOT NULL,revision INTEGER NOT NULL,service_name TEXT NOT NULL,target TEXT NOT NULL,state TEXT NOT NULL,owner TEXT NOT NULL DEFAULT '',opened_at TEXT NOT NULL,last_seen TEXT NOT NULL,resolved_at TEXT,resolution TEXT,failures INTEGER NOT NULL DEFAULT 1,version INTEGER NOT NULL DEFAULT 1);
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_incident ON incidents(service_id,revision) WHERE state IN ('open','acknowledged');
 CREATE TABLE IF NOT EXISTS incident_events(id INTEGER PRIMARY KEY AUTOINCREMENT,incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,kind TEXT NOT NULL,created_at TEXT NOT NULL,detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS console_settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,summary TEXT NOT NULL);
 ''')
+            if "source" not in {column["name"] for column in db.execute("PRAGMA table_info(runs)")}:
+                db.execute("ALTER TABLE runs ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+            saved = db.execute("SELECT value FROM console_settings WHERE key='interval_seconds'").fetchone()
+            self.schedule_interval = saved[0] if saved and 10 <= saved[0] <= 3600 else 60
             db.execute("UPDATE runs SET state='interrupted',finished_at=?,error='Console restarted before this run completed.' WHERE state IN ('queued','running')", (now(),))
+
+        self.scheduler = threading.Thread(target=self._schedule_loop, name="console-scheduler", daemon=True)
+        self.scheduler.start()
+
+    def schedule_status(self):
+        with self.lock:
+            remaining = max(0, self.schedule_due - time.monotonic()) if self.schedule_due is not None else None
+            return {"enabled": self.schedule_enabled, "interval_seconds": self.schedule_interval,
+                    "next_check_at": datetime.fromtimestamp(time.time() + remaining, timezone.utc).isoformat() if remaining is not None else None,
+                    "last_result": self.schedule_result}
+
+    def configure_schedule(self, payload):
+        if set(payload) != {"enabled", "interval_seconds"} or type(payload["enabled"]) is not bool or type(payload["interval_seconds"]) is not int:
+            raise RequestError("Send enabled and an integer interval_seconds.")
+        interval, enabled = payload["interval_seconds"], payload["enabled"]
+        if not 10 <= interval <= 3600:
+            raise RequestError("Choose an interval from 10 to 3,600 seconds.")
+        with self.lock:
+            if self.closing:
+                raise RequestError("The console is stopping.", 409)
+            if enabled and not any(service["enabled"] for service in self.services()):
+                raise RequestError("Add or enable a service before starting scheduled checks.")
+            with self.db() as db:
+                db.execute("INSERT INTO console_settings(key,value) VALUES('interval_seconds',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (interval,))
+            changed = interval != self.schedule_interval or enabled != self.schedule_enabled
+            self.schedule_interval, self.schedule_enabled = interval, enabled
+            if changed:
+                self.schedule_due = time.monotonic() + interval if enabled else None
+                self.schedule_result = "Waiting for next check" if enabled else "Stopped; any running check will finish"
+            return self.schedule_status()
+
+    def _schedule_tick(self):
+        with self.lock:
+            if self.closing or not self.schedule_enabled or self.schedule_due is None or time.monotonic() < self.schedule_due:
+                return
+            # Advance from now: missed intervals never become a backlog.
+            self.schedule_due = time.monotonic() + self.schedule_interval
+            try:
+                self.start_check(source="scheduled")
+                self.schedule_result = "Scheduled check queued"
+            except RequestError as error:
+                self.schedule_result = "Skipped: " + str(error)
+
+    def _schedule_loop(self):
+        while not self.schedule_stop.wait(.25):
+            try:
+                self._schedule_tick()
+            except Exception:
+                with self.lock:
+                    self.schedule_result = "Scheduling error; the next interval will retry"
 
     @contextmanager
     def db(self):
@@ -120,6 +180,12 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             connection.close()
 
     def close(self):
+        with self.lock:
+            self.closing = True
+            self.schedule_enabled = False
+            self.schedule_due = None
+        self.schedule_stop.set()
+        self.scheduler.join()
         self.executor.shutdown(wait=True, cancel_futures=True)
 
     def services(self):
@@ -251,12 +317,14 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
         with self.db() as db:
             rows = db.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").fetchall()
         return [{"id": row["id"], "state": row["state"], "started_at": row["started_at"], "finished_at": row["finished_at"],
-                 "report": json.loads(row["report"]) if row["report"] else None, "error": row["error"]} for row in rows]
+                 "report": json.loads(row["report"]) if row["report"] else None, "error": row["error"], "source": row["source"]} for row in rows]
 
-    def start_check(self, ids=None):
+    def start_check(self, ids=None, source="manual"):
         if ids is not None and (not isinstance(ids, list) or not ids or len(ids) > 50 or any(not isinstance(value, str) for value in ids)):
             raise RequestError("Select one or more service IDs.")
         with self.lock:
+            if self.closing:
+                raise RequestError("The console is stopping.", 409)
             snapshots = [item for item in self.services() if item["enabled"] and (ids is None or item["id"] in ids)]
             if not snapshots:
                 raise RequestError("Add or enable a service first.")
@@ -264,7 +332,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 if db.execute("SELECT COUNT(*) FROM runs WHERE state IN ('queued','running')").fetchone()[0]:
                     raise RequestError("A check is already running. Please wait for it to finish.", 409)
                 identity = uuid.uuid4().hex
-                db.execute("INSERT INTO runs(id,state,started_at) VALUES(?,?,?)", (identity, "queued", now()))
+                db.execute("INSERT INTO runs(id,state,started_at,source) VALUES(?,?,?,?)", (identity, "queued", now(), source))
             self.executor.submit(self._check_worker, identity, snapshots)
             return {"id": identity, "state": "queued"}
 
@@ -326,7 +394,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
         enabled = [item for item in services if item["enabled"]]
         durations = sorted(item["last"]["detail"].get("duration_ms", 0) for item in enabled if item["last"])
         memory = psutil.virtual_memory()
-        return {"services": services, "runs": runs, "incidents": self.incidents(), "summary": {
+        return {"services": services, "runs": runs, "incidents": self.incidents(), "schedule": self.schedule_status(), "summary": {
             "total": len(services), "enabled": len(enabled), "healthy": sum(bool(item["last"] and item["last"]["status"] == "healthy") for item in enabled),
             "warning": sum(bool(item["last"] and item["last"]["status"] != "healthy") for item in enabled),
             "unchecked": sum(item["last"] is None for item in enabled), "p95_ms": durations[max(0, math.ceil(len(durations) * .95) - 1)] if durations else None},
@@ -497,6 +565,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(201, self.state.save_service(payload))
             if method == "PATCH" and path.startswith("/api/services/"):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
+            if method == "PATCH" and path == "/api/schedule":
+                return self.response(200, self.state.configure_schedule(payload))
             if method == "POST" and path == "/api/checks":
                 if set(payload) - {"service_ids"}:
                     raise RequestError("Unsupported check options.")

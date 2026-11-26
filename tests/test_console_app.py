@@ -289,5 +289,136 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn(incident['id'], [i['id'] for i in self.state.incidents()])
 
 
+    def stop_scheduler_thread(self):
+        self.state.schedule_stop.set()
+        self.state.scheduler.join()
+
+    def due_schedule(self):
+        self.state.schedule_due = time.monotonic() - 1
+        self.state._schedule_tick()
+
+    def test_schedule_validation_and_token(self):
+        valid = {'enabled':True,'interval_seconds':10}
+        self.assertEqual(self.request('/api/schedule','PATCH',valid)[0],400)
+        self.state.save_service(self.service())
+        self.assertEqual(self.request('/api/schedule','PATCH',valid,{'X-Console-Token':''})[0],403)
+        for payload in ({'enabled':True,'interval_seconds':9}, {'enabled':True,'interval_seconds':3601}, {'enabled':True,'interval_seconds':True}, {'enabled':1,'interval_seconds':10}, {'enabled':True,'interval_seconds':10.5}, {'enabled':True}, {**valid,'extra':1}):
+            self.assertEqual(self.request('/api/schedule','PATCH',payload)[0],400,payload)
+        self.assertFalse(self.state.schedule_status()['enabled'])
+
+    def test_scheduled_checks_use_real_probes_and_mark_source(self):
+        self.stop_scheduler_thread()
+        self.state.save_service(self.service())
+        self.state.configure_schedule({'enabled':True,'interval_seconds':10})
+        self.assertEqual(self.state.runs(),[])
+        self.due_schedule()
+        run = self.finished(self.state.runs()[0]['id'])
+        self.assertEqual(run['source'],'scheduled')
+        self.assertEqual(run['report']['summary']['healthy'],1)
+        self.assertIsNotNone(self.state.schedule_status()['next_check_at'])
+
+    def test_schedule_waits_until_due_and_skips_missed_intervals(self):
+        self.stop_scheduler_thread()
+        self.state.save_service(self.service())
+        self.state.configure_schedule({'enabled':True,'interval_seconds':10})
+        self.state._schedule_tick()
+        self.assertEqual(self.state.runs(),[])
+        self.state.schedule_due = time.monotonic() - 1000
+        self.state._schedule_tick()
+        self.finished(self.state.runs()[0]['id'])
+        self.state._schedule_tick()
+        self.assertEqual(len(self.state.runs()),1)
+        self.assertGreater(self.state.schedule_due,time.monotonic())
+
+    def test_schedule_skips_overlapping_run_without_backlog(self):
+        self.stop_scheduler_thread()
+        self.state.save_service(self.service())
+        self.state.configure_schedule({'enabled':True,'interval_seconds':10})
+        entered,release=threading.Event(),threading.Event()
+        def slow_monitor(*args,**kwargs):
+            entered.set(); release.wait(5)
+            return {'services':[],'summary':{'total':0,'healthy':0,'warning':0},'status':'healthy'}
+        with patch('console_app.monitor',slow_monitor):
+            job=self.state.start_check()
+            self.assertTrue(entered.wait(3))
+            try:
+                self.due_schedule()
+                self.assertEqual(len(self.state.runs()),1)
+                self.assertIn('already running',self.state.schedule_status()['last_result'])
+                self.assertGreater(self.state.schedule_due,time.monotonic())
+            finally:
+                release.set()
+            self.finished(job['id'])
+        self.assertEqual(self.state.runs()[0]['source'],'manual')
+
+    def test_stopping_schedule_keeps_existing_run_and_blocks_future_ticks(self):
+        self.stop_scheduler_thread()
+        self.state.save_service(self.service())
+        self.state.configure_schedule({'enabled':True,'interval_seconds':10})
+        self.due_schedule()
+        job=self.state.runs()[0]
+        self.state.configure_schedule({'enabled':False,'interval_seconds':10})
+        self.finished(job['id'])
+        self.state._schedule_tick()
+        self.assertEqual(len(self.state.runs()),1)
+        self.assertIsNone(self.state.schedule_status()['next_check_at'])
+
+    def test_schedule_interval_persists_but_restart_is_stopped(self):
+        self.stop_scheduler_thread()
+        self.state.save_service(self.service())
+        self.state.configure_schedule({'enabled':True,'interval_seconds':45})
+        restarted=ConsoleState(self.root)
+        try:
+            status=restarted.schedule_status()
+            self.assertEqual(status['interval_seconds'],45)
+            self.assertFalse(status['enabled'])
+            self.assertIsNone(status['next_check_at'])
+        finally:
+            restarted.close()
+
+    def test_schedule_respects_paused_services_and_can_resume(self):
+        self.stop_scheduler_thread()
+        identity=self.state.save_service(self.service())['id']
+        self.state.configure_schedule({'enabled':True,'interval_seconds':10})
+        payload=self.service();payload['enabled']=False
+        self.state.save_service(payload,identity)
+        self.due_schedule()
+        self.assertEqual(self.state.runs(),[])
+        self.assertIn('enable a service',self.state.schedule_status()['last_result'])
+        payload['enabled']=True
+        self.state.save_service(payload,identity)
+        self.due_schedule()
+        self.finished(self.state.runs()[0]['id'])
+
+    def test_scheduled_failure_and_recovery_integrate_with_incidents(self):
+        self.stop_scheduler_thread()
+        self.finished(self.state.demo('seed')['id'])
+        self.state.configure_schedule({'enabled':True,'interval_seconds':10})
+        self.due_schedule()
+        self.finished(self.state.runs()[0]['id'])
+        self.assertEqual(self.state.incidents()[0]['failures'],2)
+        self.state.demo_degraded=False
+        self.due_schedule()
+        self.finished(self.state.runs()[0]['id'])
+        self.assertEqual(self.state.incidents()[0]['resolution'],'recovered')
+
+    def test_legacy_run_history_migrates_without_loss(self):
+        import sqlite3
+        legacy=self.root/'legacy'
+        legacy.mkdir()
+        with sqlite3.connect(legacy/'console.sqlite3') as db:
+            db.execute('CREATE TABLE runs(id TEXT PRIMARY KEY,state TEXT NOT NULL,started_at TEXT NOT NULL,finished_at TEXT,report TEXT,error TEXT)')
+            db.execute('INSERT INTO runs(id,state,started_at) VALUES(?,?,?)',('old-job','queued',now()))
+        db.close()
+        migrated=ConsoleState(self.root,data_dir=legacy)
+        try:
+            row=migrated.runs()[0]
+            self.assertEqual(row['id'],'old-job')
+            self.assertEqual(row['source'],'manual')
+            self.assertEqual(row['state'],'interrupted')
+        finally:
+            migrated.close()
+
+
 if __name__ == '__main__':
     unittest.main()

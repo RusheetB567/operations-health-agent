@@ -31,7 +31,7 @@ function serviceTable(items, compact=false) {
 }
 function runTable(items) {
  if (!items.length) return empty('Your check history starts here', 'Run a check to save an observation.');
- return `<div class="table-wrap"><table><thead><tr><th>Started</th><th>State</th><th>Healthy / total</th><th>Actions</th></tr></thead><tbody>${items.map(r => `<tr><td>${date(r.started_at)}</td><td>${badge(r.state)}</td><td>${r.report ? `${r.report.summary.healthy} / ${r.report.summary.total}` : '—'}</td><td><button class="text-button" data-run="${r.id}">View details</button></td></tr>`).join('')}</tbody></table></div>`;
+ return `<div class="table-wrap"><table><thead><tr><th>Started</th><th>State</th><th>Trigger</th><th>Healthy / total</th><th>Actions</th></tr></thead><tbody>${items.map(r => `<tr><td>${date(r.started_at)}</td><td>${badge(r.state)}</td><td>${esc(r.source || 'manual')}</td><td>${r.report ? `${r.report.summary.healthy} / ${r.report.summary.total}` : '—'}</td><td><button class="text-button" data-run="${r.id}">View details</button></td></tr>`).join('')}</tbody></table></div>`;
 }
 function renderServices() {
  if (!model) return;
@@ -43,6 +43,7 @@ function renderServices() {
 function render() {
  const {summary:s,services,runs,host,lab}=model;
  renderIncidents();
+ renderSchedule();
  $('nav-service-count').textContent=s.total;
  $('metric-enabled').textContent=s.enabled; $('metric-healthy').textContent=s.healthy; $('metric-warning').textContent=s.warning;
  $('metric-enabled-caption').textContent=`${s.total-s.enabled} paused · ${s.unchecked} unchecked`;
@@ -191,6 +192,31 @@ $('incident-filter').onchange=renderIncidents;
 $('incident-form').onsubmit=event=>{event.preventDefault();updateIncident('acknowledge');};
 $('incident-assign').onclick=()=>updateIncident('assign');
 $('incident-add-note').onclick=()=>updateIncident('note');
+let scheduleBusy = false, scheduleInitialised = false;
+function renderSchedule() {
+ const schedule=model.schedule;
+ if(!schedule)return;
+ $('schedule-state').textContent=schedule.enabled ? 'Running' : 'Stopped';
+ $('schedule-state').className='badge '+(schedule.enabled ? 'healthy' : 'paused');
+ $('schedule-next').textContent=schedule.enabled ? `Next check: ${date(schedule.next_check_at)} · every ${schedule.interval_seconds} seconds` : 'Schedules are stopped. Manual checks remain available.';
+ $('schedule-last').textContent=`${schedule.last_result}. Schedules stay stopped after a console restart.`;
+ if(!scheduleInitialised){$('schedule-interval').value=schedule.interval_seconds;scheduleInitialised=true;}
+ $('schedule-start').textContent=schedule.enabled ? 'Update interval' : 'Start schedule';
+ $('schedule-start').disabled=scheduleBusy;
+ $('schedule-stop').disabled=scheduleBusy || !schedule.enabled;
+}
+async function setSchedule(enabled) {
+ const interval=Number($('schedule-interval').value);
+ if(enabled && !$('schedule-form').reportValidity())return;
+ scheduleBusy=true;renderSchedule();
+ try {
+  await api('/api/schedule','PATCH',{enabled,interval_seconds:enabled ? interval : model.schedule.interval_seconds});
+  await refresh();toast(enabled ? 'Schedule enabled. First check runs after the selected interval.' : 'Schedule stopped. A running check will finish.');
+ } catch(error){toast(error.message,true);}
+ finally{scheduleBusy=false;renderSchedule();}
+}
+$('schedule-form').onsubmit=event=>{event.preventDefault();setSchedule(true);};
+$('schedule-stop').onclick=()=>setSchedule(false);
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
 setInterval(()=>{if(!document.hidden)refresh();},2000);
