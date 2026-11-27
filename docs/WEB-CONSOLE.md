@@ -69,3 +69,7 @@ Open an incident and choose Markdown or JSON under Export incident report. Notes
 ## Save a local report copy
 
 After previewing an incident report, select Save local copy. The exact preview is saved atomically under reports/incident-exports, and its path, byte count and checksum appear in the dialog. Previews expire after 15 minutes; only the latest eight remain available. Re-preview if needed. Existing saved files are preserved and ignored by Git. This flow was verified independently of browser downloading. See [Day 4.6](DAY-4.6-REPORT.md) and [the Day 4 wrap-up](DAY-FOUR-WRAP-UP.md).
+
+## Service reliability objectives
+
+Open Reliability and choose Set objective to save a target, lookback window and minimum sample count per service. Assessments use retained completed checks for the current configuration and maintenance cycle. They show sampled-check health, not continuous uptime or a request-level SLA. Suggested defaults remain labelled until saved. See [the Day 5 report](DAY-FIVE-REPORT.md) for calculation examples and limits.

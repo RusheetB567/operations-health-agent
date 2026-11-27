@@ -4,6 +4,7 @@ const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let model = null, editing = null, deleting = null, loading = false, toastTimer;
 const titles = {
+ reliability: ['RELIABILITY OVER TIME', 'Turn observations into objectives.', 'Understand sampled health, evidence coverage and your failure allowance.', 'Reliability'],
  incidents: ['RESPOND WITH CONTEXT', 'Give every failure a clear next step.', 'Acknowledge failures, record your investigation and verify recovery.', 'Incidents'],
  overview: ['YOUR OPERATIONS, IN ONE PLACE', 'A clearer view of your services.', 'Check what’s running. Understand what isn’t. Keep the evidence.', 'Overview'],
  services: ['YOUR SERVICE LANDSCAPE', 'Every endpoint, accounted for.', 'Connect, pause and check the services running on this device.', 'Services'],
@@ -88,6 +89,7 @@ function navigate() {
  document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==`page-${view}`);
  document.querySelectorAll('[data-view]').forEach(b=>{b.classList.toggle('active',b.dataset.view===view); b.setAttribute('aria-current',b.dataset.view===view ? 'page' : 'false');});
  const t=titles[view]; ['page-eyebrow','page-title','page-subtitle','breadcrumb-label'].forEach((id,i)=>$(id).textContent=t[i]);
+ if(view==='reliability') loadReliability();
  if(view==='evidence') loadEvidence();
  if(view==='triage') api('/api/triage/latest').then(r=>renderTriage(r.summary)).catch(e=>toast(e.message,true));
 }
@@ -123,6 +125,7 @@ document.addEventListener('click',async event=>{
  if(d.incident) openIncident(d.incident);
  if(d.maintenance) openMaintenance(d.maintenance);
  if(d.endMaintenance) {if(await change(`/api/maintenance/${d.endMaintenance}/end`,'POST',{})) {toast('Maintenance ended. The next check can observe this service.');}}
+ if(d.objective) openObjective(d.objective);
  if(d.edit) openService(d.edit);
  if(d.check) await change('/api/checks','POST',{service_ids:[d.check]});
  if(d.toggle) {
@@ -305,6 +308,36 @@ $('export-download').onclick=()=>{
  const link=document.createElement('a');link.href=url;link.download=incidentExport.filename;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
  toast('Report downloaded locally. Review it before sharing.');
 };
+let reliabilityData=null,reliabilityLoading=false,objectiveService=null;
+const objectiveLabels={met:'Meeting target',below_target:'Below target',insufficient_data:'Need more samples'};
+async function loadReliability() {
+ if(reliabilityLoading)return;reliabilityLoading=true;
+ try {
+  reliabilityData=await api('/api/reliability');const services=reliabilityData.services;
+  $('reliability-met').textContent=services.filter(s=>s.status==='met').length;
+  $('reliability-below').textContent=services.filter(s=>s.status==='below_target').length;
+  $('reliability-insufficient').textContent=services.filter(s=>s.status==='insufficient_data').length;
+  $('reliability-table').innerHTML=services.length ? `<div class="table-wrap"><table><thead><tr><th>Service</th><th>Objective</th><th>Observed healthy</th><th>Evidence</th><th>Remaining allowance</th><th>Assessment</th><th>Actions</th></tr></thead><tbody>${services.map(s=>`<tr><td><strong>${esc(s.name)}</strong><div class="muted">${esc(s.group)}${!s.enabled ? ' · paused' : s.maintenance ? ' · maintenance' : ''}</div></td><td>${s.target_percent}% over ${s.window_hours}h<div class="muted">${s.configured ? 'Saved objective' : 'Suggested default'}</div></td><td>${s.achieved_percent===null ? 'No observations' : `${s.achieved_percent}%`}</td><td>${s.healthy} healthy / ${s.samples} checks<div class="muted">Minimum ${s.min_samples}</div></td><td>${s.samples ? `${s.remaining_allowance} checks` : 'No allowance yet'}</td><td><span class="badge ${s.status}">${objectiveLabels[s.status]}</span></td><td><button class="text-button" data-objective="${s.id}">Set objective</button></td></tr>`).join('')}</tbody></table></div>` : empty('No services to evaluate','Add a local service or start the lab, then collect check observations.');
+  $('reliability-updated').textContent=`Evaluated ${date(reliabilityData.as_of)}. History retention is limited to 200 runs; sparse/manual checks may be unrepresentative.`;
+ }catch(error){$('reliability-table').innerHTML=empty('Could not load reliability',error.message);}
+ finally{reliabilityLoading=false;}
+}
+function openObjective(identity) {
+ const service=reliabilityData?.services.find(s=>s.id===identity);if(!service)return;
+ objectiveService=identity;$('objective-name').textContent=service.name;
+ $('objective-target').value=service.target_percent;$('objective-window').value=service.window_hours;$('objective-minimum').value=service.min_samples;
+ $('objective-error').hidden=true;$('objective-dialog').showModal();
+}
+$('objective-form').onsubmit=async event=>{
+ event.preventDefault();$('objective-save').disabled=true;
+ try {
+  await api(`/api/services/${objectiveService}/objective`,'PATCH',{target_percent:Number($('objective-target').value),window_hours:Number($('objective-window').value),min_samples:Number($('objective-minimum').value)});
+  $('objective-dialog').close();await loadReliability();toast('Service objective saved.');
+ }catch(error){$('objective-error').textContent=error.message;$('objective-error').hidden=false;}
+ finally{$('objective-save').disabled=false;}
+};
+$('reliability-refresh').onclick=loadReliability;
+setInterval(()=>{if(!document.hidden && location.hash==='#reliability')loadReliability();},10000);
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
 setInterval(()=>{if(!document.hidden)refresh();},2000);

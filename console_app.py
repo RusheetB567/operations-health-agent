@@ -112,6 +112,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_active_incident ON incidents(service_id,re
 CREATE TABLE IF NOT EXISTS incident_events(id INTEGER PRIMARY KEY AUTOINCREMENT,incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,kind TEXT NOT NULL,created_at TEXT NOT NULL,detail TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS console_settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS maintenance(id TEXT PRIMARY KEY,service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,reason TEXT NOT NULL,started_at REAL NOT NULL,expires_at REAL NOT NULL,ended_at REAL);
+CREATE TABLE IF NOT EXISTS objectives(service_id TEXT PRIMARY KEY REFERENCES services(id) ON DELETE CASCADE,target_percent REAL NOT NULL,window_hours INTEGER NOT NULL,min_samples INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,summary TEXT NOT NULL);
 ''')
             for table in ("services", "observations"):
@@ -175,14 +176,18 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
 
     @contextmanager
     def db(self):
-        connection = sqlite3.connect(self.db_path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys=ON")
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        # HTTP handlers, scheduler and check workers share this database. Serialize
+        # connection lifetimes so polling cannot compete with a result commit on
+        # Windows. Reuse the RLock to preserve the ordering of nested state calls.
+        with self.lock:
+            connection = sqlite3.connect(self.db_path, timeout=5)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+                with connection:
+                    yield connection
+            finally:
+                connection.close()
 
     def close(self):
         with self.lock:
@@ -448,6 +453,50 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             if note:
                 self._incident_event(db, identity, "note", note)
         return {"updated": True}
+
+    def save_objective(self, service_id, payload):
+        if set(payload) != {"target_percent","window_hours","min_samples"}:
+            raise RequestError("Provide target_percent, window_hours and min_samples.")
+        target,hours,minimum=payload["target_percent"],payload["window_hours"],payload["min_samples"]
+        if type(target) not in (int,float) or not math.isfinite(target) or not 50 <= target <= 100:
+            raise RequestError("Target must be a finite percentage from 50 to 100.")
+        if type(hours) is not int or not 1 <= hours <= 168:
+            raise RequestError("Choose a window of 1–168 whole hours.")
+        if type(minimum) is not int or not 5 <= minimum <= 200:
+            raise RequestError("Choose a minimum of 5–200 observations.")
+        with self.db() as db:
+            if not db.execute("SELECT 1 FROM services WHERE id=?",(service_id,)).fetchone():
+                raise RequestError("Service not found.",404)
+            db.execute("INSERT INTO objectives VALUES(?,?,?,?) ON CONFLICT(service_id) DO UPDATE SET target_percent=excluded.target_percent,window_hours=excluded.window_hours,min_samples=excluded.min_samples",(service_id,target,hours,minimum))
+        return {"saved":True}
+
+    def reliability(self):
+        from datetime import timedelta
+        as_of=datetime.now(timezone.utc)
+        result=[]
+        # One consistent snapshot for settings, configuration and retained observations.
+        with self.db() as db:
+            db.execute("BEGIN")
+            services=self.services()
+            for service in services:
+                saved=db.execute("SELECT * FROM objectives WHERE service_id=?",(service["id"],)).fetchone()
+                target=saved["target_percent"] if saved else 99
+                hours=saved["window_hours"] if saved else 24
+                minimum=saved["min_samples"] if saved else 10
+                cutoff=(as_of-timedelta(hours=hours)).isoformat()
+                rows=db.execute("SELECT r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC LIMIT 200",(service["id"],service["revision"],service["maintenance_version"],cutoff,as_of.isoformat())).fetchall()
+                states=[json.loads(row["payload"]).get("status") for row in rows]
+                healthy=states.count("healthy")
+                total=len(states)
+                failures=total-healthy
+                achieved=healthy/total*100 if total else None
+                allowance=total*(1-target/100)
+                status="insufficient_data" if total<minimum else "met" if achieved>=target else "below_target"
+                result.append({"id":service["id"],"name":service["name"],"group":service["group"],"enabled":service["enabled"],"maintenance":bool(service["maintenance"]),
+                               "configured":saved is not None,"target_percent":target,"window_hours":hours,"min_samples":minimum,"samples":total,"healthy":healthy,"failures":failures,
+                               "achieved_percent":round(achieved,4) if achieved is not None else None,"failure_allowance":round(allowance,6),
+                               "remaining_allowance":round(allowance-failures,6),"status":status,"last_checked_at":rows[0]["finished_at"] if rows else None})
+        return {"as_of":as_of.isoformat(),"services":result,"scope":"Sampled completed checks from retained history for the current configuration and maintenance cycle. This is not continuous uptime or request-level availability."}
 
     def runs(self):
         with self.db() as db:
@@ -735,6 +784,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     if path == "/":
                         data = data.replace("__CONSOLE_TOKEN__", self.state.token)
                     return self.response(200, data, content_type)
+                if path == "/api/reliability":
+                    return self.response(200,self.state.reliability())
                 if path == "/api/overview":
                     return self.response(200, self.state.overview())
                 if path == "/api/evidence":
@@ -764,6 +815,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(200,self.state.end_maintenance(path.split("/")[3]))
             if method == "POST" and path == "/api/services":
                 return self.response(201, self.state.save_service(payload))
+            if method == "PATCH" and path.startswith("/api/services/") and path.endswith("/objective"):
+                return self.response(200,self.state.save_objective(path.split("/")[3],payload))
             if method == "PATCH" and path.startswith("/api/services/"):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
             if method == "PATCH" and path == "/api/schedule":

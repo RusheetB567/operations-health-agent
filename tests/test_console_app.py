@@ -733,5 +733,145 @@ class ConsoleTests(unittest.TestCase):
             self.state.save_incident_export(original['preview_id'],{})
 
 
+    def test_run_polling_waits_for_result_transaction(self):
+        self.stop_scheduler_thread()
+        original_lock=self.state.lock
+        attempting,completed=threading.Event(),threading.Event()
+        failures=[]
+        results=[]
+        reader=None
+        class ObservedLock:
+            def __enter__(inner):
+                if threading.current_thread() is reader:
+                    attempting.set()
+                original_lock.acquire()
+                return inner
+            def __exit__(inner,*args):
+                original_lock.release()
+        self.state.lock=ObservedLock()
+        def poll():
+            try:
+                results.extend(self.state.runs())
+            except Exception as error:
+                failures.append(error)
+            finally:
+                completed.set()
+        try:
+            with self.state.db() as db:
+                db.execute("INSERT INTO runs(id,state,started_at) VALUES('pending-write','completed',?)",(now(),))
+                reader=threading.Thread(target=poll)
+                reader.start()
+                self.assertTrue(attempting.wait(3),'Polling must enter the shared database guard')
+                self.assertFalse(completed.is_set(),'Polling must wait for the transaction to commit')
+            reader.join(3)
+            self.assertFalse(reader.is_alive())
+            self.assertEqual(failures,[])
+            self.assertEqual(results[0]['id'],'pending-write')
+        finally:
+            if reader is not None:
+                reader.join(3)
+            self.state.lock=original_lock
+
+    def test_rollback_releases_database_guard_for_other_threads(self):
+        self.stop_scheduler_thread()
+        with self.assertRaises(RuntimeError):
+            with self.state.db() as db:
+                db.execute("INSERT INTO runs(id,state,started_at) VALUES('rolled-back','queued',?)",(now(),))
+                raise RuntimeError('simulated transaction failure')
+        outcome=[]
+        reader=threading.Thread(target=lambda:outcome.extend(self.state.runs()))
+        reader.start();reader.join(3)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(outcome,[])
+
+
+    def reliability_samples(self, healthy=4, total=5):
+        import uuid
+        identity=self.state.save_service(self.service())['id']
+        with self.state.db() as db:
+            for index in range(total):
+                run_id=uuid.uuid4().hex
+                timestamp=now()
+                db.execute("INSERT INTO runs(id,state,started_at,finished_at) VALUES(?,'completed',?,?)",(run_id,timestamp,timestamp))
+                payload=json.dumps({'status':'healthy' if index<healthy else 'warning'})
+                db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,1,?,0)',(run_id,identity,payload))
+        return identity
+
+    def test_reliability_defaults_require_evidence(self):
+        identity=self.state.save_service(self.service())['id']
+        code,result,_=self.request('/api/reliability')
+        self.assertEqual(code,200)
+        service=result['services'][0]
+        self.assertEqual(service['status'],'insufficient_data')
+        self.assertFalse(service['configured'])
+        self.assertIsNone(service['achieved_percent'])
+        self.assertEqual(service['samples'],0)
+        self.assertIsNone(service['last_checked_at'])
+
+    def test_objective_boundary_and_failure_allowance(self):
+        identity=self.reliability_samples()
+        self.state.save_objective(identity,{'target_percent':80,'window_hours':24,'min_samples':5})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'met')
+        self.assertEqual(service['achieved_percent'],80)
+        self.assertEqual(service['failure_allowance'],1)
+        self.assertEqual(service['remaining_allowance'],0)
+        self.state.save_objective(identity,{'target_percent':99,'window_hours':24,'min_samples':5})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'below_target')
+        self.assertEqual(service['remaining_allowance'],-.95)
+
+    def test_perfect_target_and_insufficient_sample_guard(self):
+        identity=self.reliability_samples(healthy=5)
+        self.state.save_objective(identity,{'target_percent':100,'window_hours':24,'min_samples':5})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'met')
+        self.assertEqual(service['remaining_allowance'],0)
+        self.state.save_objective(identity,{'target_percent':100,'window_hours':24,'min_samples':10})
+        self.assertEqual(self.state.reliability()['services'][0]['status'],'insufficient_data')
+        self.assertNotIn('NaN',json.dumps(self.state.reliability(),allow_nan=False))
+
+    def test_objectives_validate_and_persist(self):
+        identity=self.reliability_samples()
+        route=f'/api/services/{identity}/objective'
+        valid={'target_percent':95,'window_hours':48,'min_samples':5}
+        self.assertEqual(self.request(route,'PATCH',valid,{'X-Console-Token':''})[0],403)
+        for changes in ({'target_percent':True},{'target_percent':49},{'target_percent':101},{'target_percent':float('nan')},{'window_hours':0},{'window_hours':169},{'window_hours':1.5},{'min_samples':4},{'min_samples':201},{'min_samples':True},{'extra':1}):
+            self.assertEqual(self.request(route,'PATCH',{**valid,**changes})[0],400,changes)
+        self.assertEqual(self.request('/api/services/missing/objective','PATCH',valid)[0],404)
+        self.assertEqual(self.request(route,'PATCH',valid)[0],200)
+        restarted=ConsoleState(self.root)
+        try:
+            service=restarted.reliability()['services'][0]
+            self.assertTrue(service['configured'])
+            self.assertEqual(service['window_hours'],48)
+            self.assertEqual(service['target_percent'],95)
+        finally:
+            restarted.close()
+
+    def test_reliability_excludes_old_and_reconfigured_observations(self):
+        from datetime import datetime,timedelta,timezone
+        identity=self.reliability_samples()
+        with self.state.db() as db:
+            old=(datetime.now(timezone.utc)-timedelta(hours=25)).isoformat()
+            db.execute('UPDATE runs SET finished_at=? WHERE id=(SELECT run_id FROM observations LIMIT 1)',(old,))
+        self.assertEqual(self.state.reliability()['services'][0]['samples'],4)
+        payload=self.service();payload['expected_status']=204
+        self.state.save_service(payload,identity)
+        self.assertEqual(self.state.reliability()['services'][0]['samples'],0)
+
+    def test_pause_preserves_samples_and_maintenance_starts_fresh_cycle(self):
+        identity=self.reliability_samples()
+        payload=self.service();payload['enabled']=False
+        self.state.save_service(payload,identity)
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['samples'],5)
+        self.assertFalse(service['enabled'])
+        self.state.start_maintenance(identity,{'duration_minutes':5,'reason':'Upgrade'})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['samples'],0)
+        self.assertTrue(service['maintenance'])
+
+
 if __name__ == '__main__':
     unittest.main()

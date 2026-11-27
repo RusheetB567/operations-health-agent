@@ -102,3 +102,5 @@ Double-click `Start-SignalDesk.cmd` to manage local services, investigate incide
 Read [the original Day 4 console report](docs/DAY-FOUR-REPORT.md) for the initial application workflow.
 
 Read [the Day 4 wrap-up](docs/DAY-FOUR-WRAP-UP.md) for the completed SignalDesk workflow and verified local report saving.
+
+SignalDesk now includes [service reliability objectives](docs/DAY-FIVE-REPORT.md): configure sampled-check targets and distinguish insufficient evidence from target misses.
