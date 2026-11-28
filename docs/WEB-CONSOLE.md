@@ -81,3 +81,7 @@ On Reliability, select View history to inspect twelve time buckets, evidence gap
 ## Latency objectives
 
 On Reliability, choose Latency goal to enable a threshold and target for successful probes. Failed checks remain in availability and never count as latency successes. The existing lookback and sample minimum apply; incomplete successful-probe timings withhold a final latency assessment. See [Day 5.3](DAY-5.3-REPORT.md) for calculation details.
+
+## Reliability review
+
+On Reliability, filter the review panel to separate saved-target misses, missing evidence/settings, deferred work and services within saved targets. Open evidence, review an objective or follow an active incident link. The panel does not modify incident state, and unsaved defaults are not treated as committed targets. See [Day 5.4](DAY-5.4-REPORT.md).

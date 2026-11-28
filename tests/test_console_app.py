@@ -1014,5 +1014,76 @@ class ConsoleTests(unittest.TestCase):
         self.assertFalse(self.state.reliability()['services'][0]['latency']['enabled'])
 
 
+    def test_review_defaults_are_not_committed_targets(self):
+        identity=self.reliability_samples(healthy=0,total=12)
+        code,review,_=self.request('/api/reliability/review')
+        self.assertEqual(code,200)
+        item=review['items'][0]
+        self.assertEqual(item['id'],identity)
+        self.assertEqual(item['category'],'evidence_needed')
+        self.assertIn('availability_objective_not_saved',item['reasons'])
+        self.assertNotIn('availability_below_target',item['reasons'])
+
+    def test_review_saved_targets_and_counts(self):
+        identity=self.reliability_samples()
+        settings={'target_percent':80,'window_hours':24,'min_samples':5}
+        self.state.save_objective(identity,settings)
+        review=self.state.reliability_review()
+        self.assertEqual(review['items'][0]['category'],'within_target')
+        self.assertEqual(review['counts']['within_target'],1)
+        self.state.save_objective(identity,{**settings,'target_percent':95})
+        review=self.state.reliability_review()
+        self.assertEqual(review['items'][0]['category'],'action_required')
+        self.assertIn('availability_below_target',review['items'][0]['reasons'])
+        self.assertEqual(sum(review['counts'].values()),1)
+
+    def test_review_latency_miss_and_missing_evidence_are_distinct(self):
+        identity=self.latency_fixture()
+        self.state.save_objective(identity,{'target_percent':80,'window_hours':24,'min_samples':5})
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':500,'target_percent':90})
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'action_required')
+        self.assertEqual(item['reasons'],['latency_below_target'])
+        with self.state.db() as db:
+            for row in db.execute('SELECT run_id,payload FROM observations WHERE service_id=?',(identity,)).fetchall():
+                payload=json.loads(row['payload'])
+                if payload['status']=='healthy':
+                    payload['detail']['duration_ms']=None
+                    db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),row['run_id']))
+                    break
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'evidence_needed')
+        self.assertIn('latency_missing_timings',item['reasons'])
+
+    def test_review_paused_and_maintenance_services_are_deferred(self):
+        identity=self.reliability_samples()
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        payload=self.service();payload['enabled']=False
+        self.state.save_service(payload,identity)
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'deferred')
+        self.assertEqual(item['deferred_reason'],'paused')
+        self.assertIn('availability_below_target',item['reasons'])
+        payload['enabled']=True
+        self.state.save_service(payload,identity)
+        self.state.start_maintenance(identity,{'duration_minutes':5,'reason':'Upgrade'})
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'deferred')
+        self.assertEqual(item['deferred_reason'],'maintenance')
+
+    def test_review_links_incident_ownership_without_mutation_or_notes(self):
+        incident=self.lab_incident()
+        self.state.update_incident(incident['id'],{'version':incident['version'],'action':'acknowledge','owner':'Platform team','note':'PRIVATE_INVESTIGATION_NOTE'})
+        with self.state.db() as db:
+            before='\n'.join(db.iterdump())
+        review=self.state.reliability_review()
+        item=next(item for item in review['items'] if item['id']==incident['service_id'])
+        self.assertEqual(item['incidents'][0]['id'],incident['id'])
+        self.assertEqual(item['incidents'][0]['owner'],'Platform team')
+        self.assertNotIn('PRIVATE_INVESTIGATION_NOTE',json.dumps(review))
+        with self.state.db() as db:
+            self.assertEqual('\n'.join(db.iterdump()),before)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -533,6 +533,39 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                                "remaining_allowance":round(allowance-failures,6),"status":status,"last_checked_at":rows[0]["finished_at"] if rows else None})
         return {"as_of":as_of.isoformat(),"services":result,"scope":"Sampled completed checks from retained history for the current configuration and maintenance cycle. This is not continuous uptime or request-level availability."}
 
+    def reliability_review(self):
+        # Keep objective assessment and incident ownership within one database view.
+        with self.db() as db:
+            db.execute("BEGIN")
+            report=self.reliability()
+            incidents=[dict(row) for row in db.execute("SELECT id,service_id,state,owner FROM incidents WHERE state IN ('open','acknowledged') ORDER BY opened_at DESC,id")]
+        items=[]
+        counts={key:0 for key in ("action_required","evidence_needed","deferred","within_target")}
+        for service in report["services"]:
+            reasons=[]
+            if not service["configured"]:
+                reasons.append("availability_objective_not_saved")
+            elif service["status"]=="below_target":
+                reasons.append("availability_below_target")
+            if service["status"]=="insufficient_data":
+                reasons.append("availability_needs_samples")
+            latency=service["latency"]
+            if latency["enabled"]:
+                if latency["status"]=="below_target":
+                    reasons.append("latency_below_target")
+                elif latency["status"]=="insufficient_data":
+                    reasons.append("latency_missing_timings" if latency["missing_healthy_timings"] else "latency_needs_samples")
+            breached=any(reason.endswith("below_target") for reason in reasons)
+            deferred="paused" if not service["enabled"] else "maintenance" if service["maintenance"] else None
+            category="deferred" if deferred else "action_required" if breached else "evidence_needed" if reasons else "within_target"
+            counts[category]+=1
+            items.append({"id":service["id"],"name":service["name"],"group":service["group"],"category":category,"reasons":reasons,
+                "deferred_reason":deferred,"incidents":[item for item in incidents if item["service_id"]==service["id"]],
+                "availability_status":service["status"],"latency_status":latency["status"],"samples":service["samples"]})
+        rank={key:index for index,key in enumerate(counts)}
+        return {"as_of":report["as_of"],"reliability":report,"counts":counts,"items":sorted(items,key=lambda item:(rank[item["category"]],item["name"],item["id"])),
+            "scope":"Read-only review of saved objectives and retained sampled checks. Deferred items can still have unresolved incidents; meeting objectives does not close incidents."}
+
     def reliability_history(self, service_id):
         from datetime import timedelta
         with self.db() as db:
@@ -867,6 +900,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     if path == "/":
                         data = data.replace("__CONSOLE_TOKEN__", self.state.token)
                     return self.response(200, data, content_type)
+                if path == "/api/reliability/review":
+                    return self.response(200,self.state.reliability_review())
                 if path.startswith("/api/reliability/"):
                     return self.response(200,self.state.reliability_history(path.split("/")[-1]))
                 if path == "/api/reliability":

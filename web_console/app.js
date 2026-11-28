@@ -315,7 +315,7 @@ const objectiveLabels={met:'Meeting target',below_target:'Below target',insuffic
 async function loadReliability() {
  if(reliabilityLoading)return;reliabilityLoading=true;
  try {
-  reliabilityData=await api('/api/reliability');const services=reliabilityData.services;
+  reliabilityReview=await api('/api/reliability/review');reliabilityData=reliabilityReview.reliability;renderReliabilityReview();const services=reliabilityData.services;
   $('reliability-met').textContent=services.filter(s=>s.status==='met').length;
   $('reliability-below').textContent=services.filter(s=>s.status==='below_target').length;
   $('reliability-insufficient').textContent=services.filter(s=>s.status==='insufficient_data').length;
@@ -367,6 +367,16 @@ $('latency-form').onsubmit=async event=>{
  }catch(error){$('latency-error').textContent=error.message;$('latency-error').hidden=false;}
  finally{$('latency-save').disabled=false;}
 };
+let reliabilityReview=null;
+const reviewLabels={action_required:'Target miss',evidence_needed:'Evidence needed',deferred:'Deferred',within_target:'Within saved targets'};
+const reviewReasons={availability_objective_not_saved:'Save an availability objective; the default is only a suggestion.',availability_below_target:'Availability is below its saved target. Review warnings and compare check runs.',availability_needs_samples:'Collect the configured minimum of observations before assessing availability.',latency_below_target:'Successful probes are missing the saved latency target. Inspect probe timings.',latency_missing_timings:'Some successful checks lack valid timings; latency assessment is withheld.',latency_needs_samples:'Collect more successfully timed observations for the latency assessment.'};
+function renderReliabilityReview() {
+ if(!reliabilityReview)return;
+ const filter=$('review-filter').value,items=reliabilityReview.items.filter(item=>filter==='all' || item.category===filter),counts=reliabilityReview.counts;
+ $('review-counts').textContent=`${counts.action_required} target misses · ${counts.evidence_needed} need evidence/settings · ${counts.deferred} deferred · ${counts.within_target} within saved targets · ${date(reliabilityReview.as_of)}`;
+ $('review-items').innerHTML=items.length ? items.map(item=>`<article class="review-item"><div class="review-item-heading"><div><strong>${esc(item.name)}</strong><span class="muted">${esc(item.group)}</span></div><span class="badge ${item.category}">${reviewLabels[item.category]}</span></div>${item.deferred_reason ? `<p>${item.deferred_reason==='paused' ? 'Service is paused.' : 'Service is in maintenance.'} Historical assessments are retained; this is not a recovery.</p>` : ''}${item.reasons.map(reason=>`<p>${reviewReasons[reason]}</p>`).join('') || '<p>Saved objectives meet their required evidence and targets in retained observations.</p>'}<div class="review-item-actions"><button class="text-button" data-reliability-history="${item.id}">View evidence</button><button class="text-button" data-objective="${item.id}">Review objective</button>${item.incidents.slice(0,3).map(incident=>`<button class="text-button" data-incident="${incident.id}">Open incident · ${esc(incident.owner || 'Unassigned')}</button>`).join('')}</div><p class="small-note left">${item.samples} matching checks · ${item.incidents.length} active incident${item.incidents.length===1 ? '' : 's'}</p></article>`).join('') : empty('No services in this review category','Choose another filter to inspect the remaining services.');
+}
+$('review-filter').onchange=renderReliabilityReview;
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
 setInterval(()=>{if(!document.hidden)refresh();},2000);
