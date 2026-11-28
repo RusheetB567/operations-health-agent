@@ -943,5 +943,76 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(self.state.reliability_history(identity)['observations'],[])
 
 
+    def latency_fixture(self, healthy=5,total=6):
+        identity=self.reliability_samples(healthy=healthy,total=total)
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        with self.state.db() as db:
+            index=0
+            for row in db.execute('SELECT run_id,payload FROM observations WHERE service_id=? ORDER BY run_id',(identity,)).fetchall():
+                payload=json.loads(row['payload'])
+                payload['detail']={'duration_ms':[100,100,100,500,700][index%5] if payload['status']=='healthy' else 1}
+                index+=int(payload['status']=='healthy')
+                db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),row['run_id']))
+        return identity
+
+    def test_latency_boundary_and_fast_failure_exclusion(self):
+        identity=self.latency_fixture()
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':500,'target_percent':80})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'below_target')
+        self.assertEqual(service['latency']['status'],'met')
+        self.assertEqual(service['latency']['timed_healthy_checks'],5)
+        self.assertEqual(service['latency']['within_threshold'],4)
+        self.assertEqual(service['latency']['achieved_percent'],80)
+        self.assertEqual(service['latency']['p95_healthy_probe_ms'],700)
+
+    def test_fast_failed_probes_cannot_meet_latency_objective(self):
+        identity=self.latency_fixture(healthy=0,total=6)
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':500,'target_percent':95})
+        latency=self.state.reliability()['services'][0]['latency']
+        self.assertEqual(latency['status'],'insufficient_data')
+        self.assertEqual(latency['timed_healthy_checks'],0)
+        self.assertIsNone(latency['achieved_percent'])
+
+    def test_missing_or_invalid_healthy_timing_withholds_assessment(self):
+        identity=self.latency_fixture(healthy=6,total=6)
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':1000,'target_percent':100})
+        with self.state.db() as db:
+            row=db.execute('SELECT run_id,payload FROM observations WHERE service_id=? LIMIT 1',(identity,)).fetchone()
+            payload=json.loads(row['payload']);payload['detail']['duration_ms']=True
+            db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),row['run_id']))
+        latency=self.state.reliability()['services'][0]['latency']
+        self.assertEqual(latency['timed_healthy_checks'],5)
+        self.assertEqual(latency['missing_healthy_timings'],1)
+        self.assertEqual(latency['status'],'insufficient_data')
+
+    def test_latency_persistence_disable_and_maintenance_scope(self):
+        identity=self.latency_fixture()
+        settings={'enabled':True,'threshold_ms':250,'target_percent':90}
+        self.assertEqual(self.request(f'/api/services/{identity}/latency-objective','PATCH',settings)[0],200)
+        restarted=ConsoleState(self.root)
+        try:
+            latency=restarted.reliability()['services'][0]['latency']
+            self.assertTrue(latency['enabled'])
+            self.assertEqual(latency['threshold_ms'],250)
+            self.assertEqual(latency['status'],'below_target')
+        finally:
+            restarted.close()
+        self.state.start_maintenance(identity,{'duration_minutes':1,'reason':'Fresh cycle'})
+        self.assertEqual(self.state.reliability()['services'][0]['latency']['timed_healthy_checks'],0)
+        self.state.save_latency_objective(identity,{**settings,'enabled':False})
+        self.assertEqual(self.state.reliability()['services'][0]['latency']['status'],'not_enabled')
+
+    def test_latency_input_validation_and_request_protection(self):
+        identity=self.latency_fixture()
+        route=f'/api/services/{identity}/latency-objective'
+        valid={'enabled':True,'threshold_ms':500,'target_percent':95}
+        self.assertEqual(self.request(route,'PATCH',valid,{'X-Console-Token':''})[0],403)
+        for changes in ({'enabled':1},{'threshold_ms':True},{'threshold_ms':0},{'threshold_ms':60001},{'threshold_ms':1.5},{'target_percent':float('nan')},{'target_percent':True},{'target_percent':49},{'target_percent':101},{'extra':1}):
+            self.assertEqual(self.request(route,'PATCH',{**valid,**changes})[0],400,changes)
+        self.assertEqual(self.request('/api/services/missing/latency-objective','PATCH',valid)[0],404)
+        self.assertFalse(self.state.reliability()['services'][0]['latency']['enabled'])
+
+
 if __name__ == '__main__':
     unittest.main()

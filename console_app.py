@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS incident_events(id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS console_settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS maintenance(id TEXT PRIMARY KEY,service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,reason TEXT NOT NULL,started_at REAL NOT NULL,expires_at REAL NOT NULL,ended_at REAL);
 CREATE TABLE IF NOT EXISTS objectives(service_id TEXT PRIMARY KEY REFERENCES services(id) ON DELETE CASCADE,target_percent REAL NOT NULL,window_hours INTEGER NOT NULL,min_samples INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS latency_objectives(service_id TEXT PRIMARY KEY REFERENCES services(id) ON DELETE CASCADE,enabled INTEGER NOT NULL,threshold_ms INTEGER NOT NULL,target_percent REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,summary TEXT NOT NULL);
 ''')
             for table in ("services", "observations"):
@@ -470,6 +471,20 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             db.execute("INSERT INTO objectives VALUES(?,?,?,?) ON CONFLICT(service_id) DO UPDATE SET target_percent=excluded.target_percent,window_hours=excluded.window_hours,min_samples=excluded.min_samples",(service_id,target,hours,minimum))
         return {"saved":True}
 
+    def save_latency_objective(self, service_id, payload):
+        if set(payload) != {"enabled","threshold_ms","target_percent"} or type(payload.get("enabled")) is not bool:
+            raise RequestError("Provide enabled, threshold_ms and target_percent.")
+        threshold,target=payload["threshold_ms"],payload["target_percent"]
+        if type(threshold) is not int or not 1 <= threshold <= 60000:
+            raise RequestError("Choose a threshold of 1–60,000 whole milliseconds.")
+        if type(target) not in (int,float) or not math.isfinite(target) or not 50 <= target <= 100:
+            raise RequestError("Latency target must be a finite percentage from 50 to 100.")
+        with self.db() as db:
+            if not db.execute("SELECT 1 FROM services WHERE id=?",(service_id,)).fetchone():
+                raise RequestError("Service not found.",404)
+            db.execute("INSERT INTO latency_objectives VALUES(?,?,?,?) ON CONFLICT(service_id) DO UPDATE SET enabled=excluded.enabled,threshold_ms=excluded.threshold_ms,target_percent=excluded.target_percent",(service_id,int(payload["enabled"]),threshold,target))
+        return {"saved":True}
+
     def reliability(self):
         from datetime import timedelta
         as_of=datetime.now(timezone.utc)
@@ -492,8 +507,28 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 achieved=healthy/total*100 if total else None
                 allowance=total*(1-target/100)
                 status="insufficient_data" if total<minimum else "met" if achieved>=target else "below_target"
+                latency_saved=db.execute("SELECT * FROM latency_objectives WHERE service_id=?",(service["id"],)).fetchone()
+                latency_enabled=bool(latency_saved and latency_saved["enabled"])
+                threshold=latency_saved["threshold_ms"] if latency_saved else 500
+                latency_target=latency_saved["target_percent"] if latency_saved else 95
+                healthy_timings=[]
+                for row in rows:
+                    observation=json.loads(row["payload"])
+                    timing=observation.get("detail",{}).get("duration_ms")
+                    if observation.get("status")=="healthy" and type(timing) in (int,float) and math.isfinite(timing) and timing>=0:
+                        healthy_timings.append(timing)
+                within=sum(value<=threshold for value in healthy_timings)
+                timed=len(healthy_timings)
+                missing=healthy-timed
+                latency_achieved=within/timed*100 if timed else None
+                latency_status="not_enabled" if not latency_enabled else "insufficient_data" if timed<minimum or missing else "met" if latency_achieved>=latency_target else "below_target"
+                ordered=sorted(healthy_timings)
+                latency={"enabled":latency_enabled,"threshold_ms":threshold,"target_percent":latency_target,"status":latency_status,
+                    "healthy_checks":healthy,"timed_healthy_checks":timed,"missing_healthy_timings":missing,"within_threshold":within,
+                    "achieved_percent":round(latency_achieved,4) if latency_achieved is not None else None,
+                    "p95_healthy_probe_ms":ordered[math.ceil(timed*.95)-1] if timed else None}
                 result.append({"id":service["id"],"name":service["name"],"group":service["group"],"enabled":service["enabled"],"maintenance":bool(service["maintenance"]),
-                               "configured":saved is not None,"target_percent":target,"window_hours":hours,"min_samples":minimum,"samples":total,"healthy":healthy,"failures":failures,
+                               "latency":latency,"configured":saved is not None,"target_percent":target,"window_hours":hours,"min_samples":minimum,"samples":total,"healthy":healthy,"failures":failures,
                                "achieved_percent":round(achieved,4) if achieved is not None else None,"failure_allowance":round(allowance,6),
                                "remaining_allowance":round(allowance-failures,6),"status":status,"last_checked_at":rows[0]["finished_at"] if rows else None})
         return {"as_of":as_of.isoformat(),"services":result,"scope":"Sampled completed checks from retained history for the current configuration and maintenance cycle. This is not continuous uptime or request-level availability."}
@@ -867,6 +902,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(201, self.state.save_service(payload))
             if method == "PATCH" and path.startswith("/api/services/") and path.endswith("/objective"):
                 return self.response(200,self.state.save_objective(path.split("/")[3],payload))
+            if method == "PATCH" and path.startswith("/api/services/") and path.endswith("/latency-objective"):
+                return self.response(200,self.state.save_latency_objective(path.split("/")[3],payload))
             if method == "PATCH" and path.startswith("/api/services/"):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
             if method == "PATCH" and path == "/api/schedule":

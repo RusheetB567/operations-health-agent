@@ -77,3 +77,7 @@ Open Reliability and choose Set objective to save a target, lookback window and 
 ## Reliability history
 
 On Reliability, select View history to inspect twelve time buckets, evidence gaps, warning streaks, P95 probe duration and the latest matching observations. Trends require at least six observations and the objective minimum, compare equal groups and remain descriptive. Close and reopen to refresh. See [Day 5.2](DAY-5.2-REPORT.md) and [the Day 5 wrap-up](DAY-FIVE-WRAP-UP.md).
+
+## Latency objectives
+
+On Reliability, choose Latency goal to enable a threshold and target for successful probes. Failed checks remain in availability and never count as latency successes. The existing lookback and sample minimum apply; incomplete successful-probe timings withhold a final latency assessment. See [Day 5.3](DAY-5.3-REPORT.md) for calculation details.
