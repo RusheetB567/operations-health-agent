@@ -498,6 +498,54 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                                "remaining_allowance":round(allowance-failures,6),"status":status,"last_checked_at":rows[0]["finished_at"] if rows else None})
         return {"as_of":as_of.isoformat(),"services":result,"scope":"Sampled completed checks from retained history for the current configuration and maintenance cycle. This is not continuous uptime or request-level availability."}
 
+    def reliability_history(self, service_id):
+        from datetime import timedelta
+        with self.db() as db:
+            db.execute("BEGIN")
+            service=next((s for s in self.services() if s["id"]==service_id),None)
+            if service is None:
+                raise RequestError("Service not found.",404)
+            report=self.reliability()
+            objective=next(s for s in report["services"] if s["id"]==service_id)
+            end=datetime.fromisoformat(report["as_of"])
+            start=end-timedelta(hours=objective["window_hours"])
+            rows=db.execute("SELECT r.id,r.source,r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC,r.id DESC LIMIT 200",(service_id,service["revision"],service["maintenance_version"],start.isoformat(),end.isoformat())).fetchall()
+        observations=[]
+        for row in rows:
+            value=json.loads(row["payload"])
+            detail=value.get("detail",{})
+            duration=detail.get("duration_ms")
+            observations.append({"run_id":row["id"],"source":row["source"],"finished_at":row["finished_at"],"status":value.get("status"),
+                "probe_status":detail.get("status"),"http_status":detail.get("http_status"),
+                "duration_ms":duration if type(duration) in (int,float) and math.isfinite(duration) and duration>=0 else None})
+        states=[item["status"] for item in observations]
+        streak=0
+        for state in states:
+            if state=="healthy":
+                break
+            streak+=1
+        measured=sorted(item["duration_ms"] for item in observations if item["duration_ms"] is not None)
+        trend={"status":"insufficient_data","samples_per_group":0,"previous_percent":None,"recent_percent":None,"difference_pp":None}
+        if len(states)>=max(6,objective["min_samples"]):
+            half=len(states)//2
+            recent=states[:half].count("healthy")/half*100
+            previous=states[half:half*2].count("healthy")/half*100
+            delta=recent-previous
+            trend={"status":"improving" if delta>0 else "declining" if delta<0 else "unchanged","samples_per_group":half,
+                "previous_percent":round(previous,4),"recent_percent":round(recent,4),"difference_pp":round(delta,4)}
+        width=objective["window_hours"]*3600/12
+        buckets=[{"start":(start+timedelta(seconds=width*i)).isoformat(),"end":(start+timedelta(seconds=width*(i+1))).isoformat(),"samples":0,"healthy":0,"healthy_percent":None} for i in range(12)]
+        for item in observations:
+            index=min(11,max(0,int((datetime.fromisoformat(item["finished_at"])-start).total_seconds()/width)))
+            buckets[index]["samples"]+=1
+            buckets[index]["healthy"]+=int(item["status"]=="healthy")
+        for bucket in buckets:
+            if bucket["samples"]:
+                bucket["healthy_percent"]=round(bucket["healthy"]/bucket["samples"]*100,4)
+        return {"as_of":report["as_of"],"service":objective,"observations":observations,"buckets":buckets,"trend":trend,
+            "consecutive_warnings":streak,"timed_samples":len(measured),"p95_probe_ms":measured[math.ceil(len(measured)*.95)-1] if measured else None,
+            "scope":report["scope"]}
+
     def runs(self):
         with self.db() as db:
             rows = db.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").fetchall()
@@ -784,6 +832,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     if path == "/":
                         data = data.replace("__CONSOLE_TOKEN__", self.state.token)
                     return self.response(200, data, content_type)
+                if path.startswith("/api/reliability/"):
+                    return self.response(200,self.state.reliability_history(path.split("/")[-1]))
                 if path == "/api/reliability":
                     return self.response(200,self.state.reliability())
                 if path == "/api/overview":

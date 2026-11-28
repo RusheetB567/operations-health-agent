@@ -873,5 +873,75 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(service['maintenance'])
 
 
+    def test_history_missing_service_and_empty_evidence(self):
+        self.assertEqual(self.request('/api/reliability/missing')[0],404)
+        identity=self.state.save_service(self.service())['id']
+        code,history,_=self.request('/api/reliability/'+identity)
+        self.assertEqual(code,200)
+        self.assertEqual(history['observations'],[])
+        self.assertEqual(history['trend']['status'],'insufficient_data')
+        self.assertIsNone(history['p95_probe_ms'])
+        self.assertTrue(all(b['healthy_percent'] is None for b in history['buckets']))
+
+    def test_history_buckets_preserve_gaps_and_sample_counts(self):
+        identity=self.reliability_samples(healthy=3,total=6)
+        history=self.state.reliability_history(identity)
+        self.assertEqual(len(history['buckets']),12)
+        self.assertEqual(sum(b['samples'] for b in history['buckets']),6)
+        nonempty=[b for b in history['buckets'] if b['samples']]
+        self.assertEqual(len(nonempty),1)
+        self.assertEqual(nonempty[0]['healthy_percent'],50)
+        self.assertEqual(history['service']['samples'],len(history['observations']))
+        self.assertEqual(history['consecutive_warnings'],3)
+
+    def test_history_trend_decline_and_improvement(self):
+        identity=self.reliability_samples(healthy=3,total=6)
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        history=self.state.reliability_history(identity)
+        self.assertEqual(history['trend']['status'],'declining')
+        self.assertEqual(history['trend']['difference_pp'],-100)
+        with self.state.db() as db:
+            for item in history['observations']:
+                db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps({'status':'warning' if item['status']=='healthy' else 'healthy'}),item['run_id']))
+        updated=self.state.reliability_history(identity)
+        self.assertEqual(updated['trend']['status'],'improving')
+        self.assertEqual(updated['trend']['difference_pp'],100)
+        self.assertEqual(updated['consecutive_warnings'],0)
+
+    def test_history_trend_minimum_and_odd_count(self):
+        identity=self.reliability_samples(healthy=3,total=7)
+        self.assertEqual(self.state.reliability_history(identity)['trend']['status'],'insufficient_data')
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        trend=self.state.reliability_history(identity)['trend']
+        self.assertEqual(trend['samples_per_group'],3)
+        self.assertEqual(trend['recent_percent'],0)
+        self.assertAlmostEqual(trend['previous_percent'],66.6667)
+
+    def test_history_timing_validation_and_field_whitelist(self):
+        identity=self.reliability_samples(healthy=5,total=5)
+        history=self.state.reliability_history(identity)
+        with self.state.db() as db:
+            for item,value in zip(history['observations'],[True,-1,3,4,100]):
+                payload={'status':'healthy','detail':{'status':'ready','duration_ms':value,'raw_message':'PRIVATE_MARKER'}}
+                db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),item['run_id']))
+        result=self.state.reliability_history(identity)
+        self.assertEqual(result['timed_samples'],3)
+        self.assertEqual(result['p95_probe_ms'],100)
+        self.assertNotIn('PRIVATE_MARKER',json.dumps(result))
+
+    def test_history_scope_and_read_only_behaviour(self):
+        identity=self.reliability_samples()
+        with self.state.db() as db:
+            before='\n'.join(db.iterdump())
+        self.state.reliability_history(identity)
+        with self.state.db() as db:
+            self.assertEqual('\n'.join(db.iterdump()),before)
+        self.state.start_maintenance(identity,{'duration_minutes':5,'reason':'New cycle'})
+        self.assertEqual(self.state.reliability_history(identity)['observations'],[])
+        payload=self.service();payload['expected_status']=204
+        self.state.save_service(payload,identity)
+        self.assertEqual(self.state.reliability_history(identity)['observations'],[])
+
+
 if __name__ == '__main__':
     unittest.main()

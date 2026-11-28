@@ -125,6 +125,7 @@ document.addEventListener('click',async event=>{
  if(d.incident) openIncident(d.incident);
  if(d.maintenance) openMaintenance(d.maintenance);
  if(d.endMaintenance) {if(await change(`/api/maintenance/${d.endMaintenance}/end`,'POST',{})) {toast('Maintenance ended. The next check can observe this service.');}}
+ if(d.reliabilityHistory) openReliabilityHistory(d.reliabilityHistory);
  if(d.objective) openObjective(d.objective);
  if(d.edit) openService(d.edit);
  if(d.check) await change('/api/checks','POST',{service_ids:[d.check]});
@@ -317,7 +318,7 @@ async function loadReliability() {
   $('reliability-met').textContent=services.filter(s=>s.status==='met').length;
   $('reliability-below').textContent=services.filter(s=>s.status==='below_target').length;
   $('reliability-insufficient').textContent=services.filter(s=>s.status==='insufficient_data').length;
-  $('reliability-table').innerHTML=services.length ? `<div class="table-wrap"><table><thead><tr><th>Service</th><th>Objective</th><th>Observed healthy</th><th>Evidence</th><th>Remaining allowance</th><th>Assessment</th><th>Actions</th></tr></thead><tbody>${services.map(s=>`<tr><td><strong>${esc(s.name)}</strong><div class="muted">${esc(s.group)}${!s.enabled ? ' · paused' : s.maintenance ? ' · maintenance' : ''}</div></td><td>${s.target_percent}% over ${s.window_hours}h<div class="muted">${s.configured ? 'Saved objective' : 'Suggested default'}</div></td><td>${s.achieved_percent===null ? 'No observations' : `${s.achieved_percent}%`}</td><td>${s.healthy} healthy / ${s.samples} checks<div class="muted">Minimum ${s.min_samples}</div></td><td>${s.samples ? `${s.remaining_allowance} checks` : 'No allowance yet'}</td><td><span class="badge ${s.status}">${objectiveLabels[s.status]}</span></td><td><button class="text-button" data-objective="${s.id}">Set objective</button></td></tr>`).join('')}</tbody></table></div>` : empty('No services to evaluate','Add a local service or start the lab, then collect check observations.');
+  $('reliability-table').innerHTML=services.length ? `<div class="table-wrap"><table><thead><tr><th>Service</th><th>Objective</th><th>Observed healthy</th><th>Evidence</th><th>Remaining allowance</th><th>Assessment</th><th>Actions</th></tr></thead><tbody>${services.map(s=>`<tr><td><strong>${esc(s.name)}</strong><div class="muted">${esc(s.group)}${!s.enabled ? ' · paused' : s.maintenance ? ' · maintenance' : ''}</div></td><td>${s.target_percent}% over ${s.window_hours}h<div class="muted">${s.configured ? 'Saved objective' : 'Suggested default'}</div></td><td>${s.achieved_percent===null ? 'No observations' : `${s.achieved_percent}%`}</td><td>${s.healthy} healthy / ${s.samples} checks<div class="muted">Minimum ${s.min_samples}</div></td><td>${s.samples ? `${s.remaining_allowance} checks` : 'No allowance yet'}</td><td><span class="badge ${s.status}">${objectiveLabels[s.status]}</span></td><td><div class="row-actions"><button class="text-button" data-reliability-history="${s.id}">View history</button><button class="text-button" data-objective="${s.id}">Set objective</button></div></td></tr>`).join('')}</tbody></table></div>` : empty('No services to evaluate','Add a local service or start the lab, then collect check observations.');
   $('reliability-updated').textContent=`Evaluated ${date(reliabilityData.as_of)}. History retention is limited to 200 runs; sparse/manual checks may be unrepresentative.`;
  }catch(error){$('reliability-table').innerHTML=empty('Could not load reliability',error.message);}
  finally{reliabilityLoading=false;}
@@ -338,6 +339,18 @@ $('objective-form').onsubmit=async event=>{
 };
 $('reliability-refresh').onclick=loadReliability;
 setInterval(()=>{if(!document.hidden && location.hash==='#reliability')loadReliability();},10000);
+let historyRequest=0;
+async function openReliabilityHistory(identity) {
+ const request=++historyRequest;
+ $('history-title').textContent='Service history';$('history-content').textContent='Loading observations…';
+ if(!$('reliability-history-dialog').open)$('reliability-history-dialog').showModal();
+ try {
+  const h=await api(`/api/reliability/${identity}`);if(request!==historyRequest)return;
+  $('history-title').textContent=h.service.name;
+  const trend=h.trend.status==='insufficient_data' ? 'More observations needed for a trend' : `${h.trend.status}: ${h.trend.previous_percent}% to ${h.trend.recent_percent}% (${h.trend.difference_pp>0 ? '+' : ''}${h.trend.difference_pp} percentage points)`;
+  $('history-content').innerHTML=`<div class="notice info">${esc(h.scope)}</div><div class="history-metrics"><div><strong>${h.consecutive_warnings}</strong><span>Latest consecutive warnings</span></div><div><strong>${duration(h.p95_probe_ms)}</strong><span>P95 probe duration · ${h.timed_samples} timed checks</span></div></div><h3>Sampled health over ${h.service.window_hours} hours</h3><p class="small-note left">Twelve equal time buckets, oldest to newest. Empty buckets are gaps in evidence.</p><div class="history-chart" role="list" aria-label="Sampled healthy checks by time bucket">${h.buckets.map(b=>`<div class="history-bucket" role="listitem" aria-label="${esc(date(b.start))} to ${esc(date(b.end))}: ${b.samples ? `${b.healthy_percent}% healthy from ${b.samples} checks` : 'No observations'}"><div class="history-bar-track ${b.samples ? '' : 'no-data'}"><div style="height:${b.healthy_percent ?? 0}%"></div></div><strong>${b.samples ? `${Math.round(b.healthy_percent)}%` : 'Gap'}</strong><span>${b.samples} checks</span></div>`).join('')}</div><p class="small-note left">${date(h.buckets[0].start)} to ${date(h.buckets[11].end)}</p><h3>Recent sample trend</h3><p>${esc(trend)}</p><p class="small-note left">${h.trend.samples_per_group ? `Equal groups of ${h.trend.samples_per_group} observations, newest versus preceding. With an odd sample count, the oldest extra observation is omitted. Descriptive only; not a forecast.` : "At least six observations and the configured minimum are required. No trend is inferred from sparse evidence."}</p><h3>Latest observations</h3><p class="small-note left">Showing ${Math.min(50,h.observations.length)} of ${h.observations.length} matching observations. Probe duration includes process overhead. Close and reopen to refresh.</p>${h.observations.length ? `<div class="table-wrap"><table><thead><tr><th>Finished</th><th>Trigger</th><th>Health</th><th>Probe result</th><th>Duration</th></tr></thead><tbody>${h.observations.slice(0,50).map(o=>`<tr><td>${date(o.finished_at)}</td><td>${esc(o.source)}</td><td>${badge(o.status)}</td><td>${esc(o.probe_status || 'Not recorded')}${o.http_status ? ` · HTTP ${esc(o.http_status)}` : ''}</td><td>${duration(o.duration_ms)}</td></tr>`).join('')}</tbody></table></div>` : empty('No matching observations','Run checks for the current configuration to collect evidence.')}`;
+ }catch(error){if(request===historyRequest)$('history-content').textContent=error.message;}
+}
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
 setInterval(()=>{if(!document.hidden)refresh();},2000);

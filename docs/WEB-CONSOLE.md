@@ -73,3 +73,7 @@ After previewing an incident report, select Save local copy. The exact preview i
 ## Service reliability objectives
 
 Open Reliability and choose Set objective to save a target, lookback window and minimum sample count per service. Assessments use retained completed checks for the current configuration and maintenance cycle. They show sampled-check health, not continuous uptime or a request-level SLA. Suggested defaults remain labelled until saved. See [the Day 5 report](DAY-FIVE-REPORT.md) for calculation examples and limits.
+
+## Reliability history
+
+On Reliability, select View history to inspect twelve time buckets, evidence gaps, warning streaks, P95 probe duration and the latest matching observations. Trends require at least six observations and the objective minimum, compare equal groups and remain descriptive. Close and reopen to refresh. See [Day 5.2](DAY-5.2-REPORT.md) and [the Day 5 wrap-up](DAY-FIVE-WRAP-UP.md).
