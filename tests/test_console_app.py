@@ -787,11 +787,13 @@ class ConsoleTests(unittest.TestCase):
 
     def reliability_samples(self, healthy=4, total=5):
         import uuid
+        from datetime import datetime,timedelta,timezone
+        base=datetime.now(timezone.utc)-timedelta(seconds=total)
         identity=self.state.save_service(self.service())['id']
         with self.state.db() as db:
             for index in range(total):
                 run_id=uuid.uuid4().hex
-                timestamp=now()
+                timestamp=(base+timedelta(seconds=index)).isoformat()
                 db.execute("INSERT INTO runs(id,state,started_at,finished_at) VALUES(?,'completed',?,?)",(run_id,timestamp,timestamp))
                 payload=json.dumps({'status':'healthy' if index<healthy else 'warning'})
                 db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,1,?,0)',(run_id,identity,payload))
@@ -1083,6 +1085,39 @@ class ConsoleTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_INVESTIGATION_NOTE',json.dumps(review))
         with self.state.db() as db:
             self.assertEqual('\n'.join(db.iterdump()),before)
+
+
+    def test_equal_timestamps_preserve_observation_order(self):
+        identity=self.state.save_service(self.service())['id']
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        timestamp=now()
+        with self.state.db() as db:
+            for index in range(6):
+                run_id=f'tied-{6-index}'  # Deliberately opposite to insertion order.
+                payload=json.dumps({'status':'healthy' if index<3 else 'warning','detail':{}})
+                db.execute("INSERT INTO runs(id,state,started_at,finished_at) VALUES(?,'completed',?,?)",(run_id,timestamp,timestamp))
+                db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,1,?,0)',(run_id,identity,payload))
+        history=self.state.reliability_history(identity)
+        self.assertEqual([item['run_id'] for item in history['observations']],['tied-1','tied-2','tied-3','tied-4','tied-5','tied-6'])
+        self.assertEqual(history['consecutive_warnings'],3)
+        self.assertEqual(history['trend']['status'],'declining')
+        self.assertEqual(history['trend']['difference_pp'],-100)
+        self.assertEqual(self.state.services()[0]['last']['status'],'warning')
+        self.assertEqual(self.state.runs()[0]['id'],'tied-1')
+
+    def test_equal_timestamp_history_survives_database_restart(self):
+        identity=self.state.save_service(self.service())['id']
+        timestamp=now()
+        with self.state.db() as db:
+            for run_id,status in (('z-first','warning'),('a-second','healthy')):
+                db.execute("INSERT INTO runs(id,state,started_at,finished_at) VALUES(?,'completed',?,?)",(run_id,timestamp,timestamp))
+                db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,1,?,0)',(run_id,identity,json.dumps({'status':status,'detail':{}})))
+        restarted=ConsoleState(self.root)
+        try:
+            self.assertEqual(restarted.reliability_history(identity)['observations'][0]['run_id'],'a-second')
+            self.assertEqual(restarted.services()[0]['last']['status'],'healthy')
+        finally:
+            restarted.close()
 
 
 if __name__ == '__main__':

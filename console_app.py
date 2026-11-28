@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             rows = db.execute("SELECT * FROM services ORDER BY created_at,id").fetchall()
             results = []
             for row in rows:
-                last = db.execute("SELECT o.payload,r.finished_at FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' ORDER BY r.finished_at DESC LIMIT 1", (row["id"], row["revision"], row["maintenance_version"])).fetchone()
+                last = db.execute("SELECT o.payload,r.finished_at FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 1", (row["id"], row["revision"], row["maintenance_version"])).fetchone()
                 value = {"id": row["id"], "name": row["name"], "group": row["group_name"], "type": row["protocol"],
                          "target": row["target"], "timeout": row["timeout"], "expected_status": row["expected_status"],
                          "enabled": bool(row["enabled"]), "is_demo": bool(row["is_demo"]), "revision": row["revision"],
@@ -331,7 +331,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 raise RequestError("Incident not found; it may have expired from history.",404)
             incident=dict(row)
             events=[dict(item) for item in db.execute("SELECT kind,created_at,detail FROM incident_events WHERE incident_id=? ORDER BY id LIMIT 200",(identity,)) if payload["include_notes"] or item["kind"] != "note"]
-            records=db.execute("SELECT r.id,r.finished_at,r.source,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND r.state='completed' AND r.finished_at>=? AND r.started_at<=? ORDER BY r.finished_at DESC LIMIT 101",(incident["service_id"],incident["revision"],incident["opened_at"],incident["resolved_at"] or now())).fetchall()
+            records=db.execute("SELECT r.id,r.finished_at,r.source,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND r.state='completed' AND r.finished_at>=? AND r.started_at<=? ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 101",(incident["service_id"],incident["revision"],incident["opened_at"],incident["resolved_at"] or now())).fetchall()
         evidence=[]
         for item in reversed(records[:100]):
             result=json.loads(item["payload"])
@@ -499,7 +499,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 hours=saved["window_hours"] if saved else 24
                 minimum=saved["min_samples"] if saved else 10
                 cutoff=(as_of-timedelta(hours=hours)).isoformat()
-                rows=db.execute("SELECT r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC LIMIT 200",(service["id"],service["revision"],service["maintenance_version"],cutoff,as_of.isoformat())).fetchall()
+                rows=db.execute("SELECT r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 200",(service["id"],service["revision"],service["maintenance_version"],cutoff,as_of.isoformat())).fetchall()
                 states=[json.loads(row["payload"]).get("status") for row in rows]
                 healthy=states.count("healthy")
                 total=len(states)
@@ -566,6 +566,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
         return {"as_of":report["as_of"],"reliability":report,"counts":counts,"items":sorted(items,key=lambda item:(rank[item["category"]],item["name"],item["id"])),
             "scope":"Read-only review of saved objectives and retained sampled checks. Deferred items can still have unresolved incidents; meeting objectives does not close incidents."}
 
+    # SQLite insertion order breaks timestamp ties; UUIDs are not chronological.
     def reliability_history(self, service_id):
         from datetime import timedelta
         with self.db() as db:
@@ -577,7 +578,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             objective=next(s for s in report["services"] if s["id"]==service_id)
             end=datetime.fromisoformat(report["as_of"])
             start=end-timedelta(hours=objective["window_hours"])
-            rows=db.execute("SELECT r.id,r.source,r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC,r.id DESC LIMIT 200",(service_id,service["revision"],service["maintenance_version"],start.isoformat(),end.isoformat())).fetchall()
+            rows=db.execute("SELECT r.id,r.source,r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 200",(service_id,service["revision"],service["maintenance_version"],start.isoformat(),end.isoformat())).fetchall()
         observations=[]
         for row in rows:
             value=json.loads(row["payload"])
@@ -616,7 +617,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
 
     def runs(self):
         with self.db() as db:
-            rows = db.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").fetchall()
+            rows = db.execute("SELECT * FROM runs ORDER BY started_at DESC,rowid DESC LIMIT 30").fetchall()
         return [{"id": row["id"], "state": row["state"], "started_at": row["started_at"], "finished_at": row["finished_at"],
                  "report": json.loads(row["report"]) if row["report"] else None, "error": row["error"], "source": row["source"]} for row in rows]
 
@@ -707,7 +708,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                     self._observe_incident(db, source, result)
                     db.execute("INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,?,?,?)", (identity, source["id"], source["revision"], json.dumps(result), source["maintenance_version"]))
                 db.execute("UPDATE runs SET state='completed',finished_at=?,report=? WHERE id=?", (now(), json.dumps(report), identity))
-                db.execute("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY started_at DESC LIMIT 200)")
+                db.execute("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY started_at DESC,rowid DESC LIMIT 200)")
         except Exception:
             with self.db() as db:
                 db.execute("UPDATE runs SET state='failed',finished_at=?,error=? WHERE id=?", (now(), "The check could not complete. Try again after reviewing the service settings.", identity))
