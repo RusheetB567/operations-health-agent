@@ -1120,5 +1120,53 @@ class ConsoleTests(unittest.TestCase):
             restarted.close()
 
 
+    def test_reliability_export_filter_and_contents(self):
+        identity=self.reliability_samples()
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        code,preview,_=self.request('/api/reliability/export','POST',{'format':'json','category':'action_required'})
+        self.assertEqual(code,200)
+        report=json.loads(preview['content'])
+        self.assertEqual(report['report_type'],'reliability-review')
+        self.assertEqual(report['counts']['action_required'],1)
+        self.assertEqual(report['services'][0]['id'],identity)
+        self.assertEqual(report['services'][0]['objective']['target_percent'],95)
+        self.assertEqual(self.state.export_reliability_review({'format':'json','category':'deferred'})['summary']['services'],0)
+
+    def test_reliability_export_exact_save_and_frozen_snapshot(self):
+        import hashlib
+        identity=self.reliability_samples()
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        preview=self.state.export_reliability_review({'format':'markdown','category':'all'})
+        self.state.save_objective(identity,{'target_percent':80,'window_hours':24,'min_samples':5})
+        saved=self.state.save_incident_export(preview['preview_id'],{})
+        self.assertTrue(saved['path'].startswith('reports/reliability-exports/'))
+        content=(self.root/saved['path']).read_bytes()
+        self.assertEqual(content,preview['content'].encode('utf-8'))
+        self.assertEqual(saved['sha256'],hashlib.sha256(content).hexdigest())
+        self.assertEqual(self.state.save_incident_export(preview['preview_id'],{}),saved)
+
+    def test_reliability_export_excludes_notes_addresses_and_preserves_database(self):
+        incident=self.lab_incident()
+        self.state.update_incident(incident['id'],{'version':incident['version'],'action':'acknowledge','owner':'Platform','note':'PRIVATE_REPORT_NOTE'})
+        with self.state.db() as db:
+            before='\n'.join(db.iterdump())
+        for format in ('json','markdown'):
+            preview=self.state.export_reliability_review({'format':format,'category':'all'})
+            self.assertNotIn('PRIVATE_REPORT_NOTE',preview['content'])
+            self.assertNotIn('http://127.0.0.1',preview['content'])
+            self.assertIn('Platform',preview['content'])
+        with self.state.db() as db:
+            self.assertEqual('\n'.join(db.iterdump()),before)
+
+    def test_reliability_export_validation_and_empty_workspace(self):
+        valid={'format':'json','category':'all'}
+        self.assertEqual(self.request('/api/reliability/export','POST',valid,{'X-Console-Token':''})[0],403)
+        for payload in ({},{'format':'html','category':'all'},{'format':'json','category':'unknown'},{'format':'json','category':[]},{**valid,'path':'outside.json'}):
+            self.assertEqual(self.request('/api/reliability/export','POST',payload)[0],400)
+        code,result,_=self.request('/api/reliability/export','POST',valid)
+        self.assertEqual(code,200)
+        self.assertEqual(result['summary']['services'],0)
+
+
 if __name__ == '__main__':
     unittest.main()

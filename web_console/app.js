@@ -377,6 +377,32 @@ function renderReliabilityReview() {
  $('review-items').innerHTML=items.length ? items.map(item=>`<article class="review-item"><div class="review-item-heading"><div><strong>${esc(item.name)}</strong><span class="muted">${esc(item.group)}</span></div><span class="badge ${item.category}">${reviewLabels[item.category]}</span></div>${item.deferred_reason ? `<p>${item.deferred_reason==='paused' ? 'Service is paused.' : 'Service is in maintenance.'} Historical assessments are retained; this is not a recovery.</p>` : ''}${item.reasons.map(reason=>`<p>${reviewReasons[reason]}</p>`).join('') || '<p>Saved objectives meet their required evidence and targets in retained observations.</p>'}<div class="review-item-actions"><button class="text-button" data-reliability-history="${item.id}">View evidence</button><button class="text-button" data-objective="${item.id}">Review objective</button>${item.incidents.slice(0,3).map(incident=>`<button class="text-button" data-incident="${incident.id}">Open incident · ${esc(incident.owner || 'Unassigned')}</button>`).join('')}</div><p class="small-note left">${item.samples} matching checks · ${item.incidents.length} active incident${item.incidents.length===1 ? '' : 's'}</p></article>`).join('') : empty('No services in this review category','Choose another filter to inspect the remaining services.');
 }
 $('review-filter').onchange=renderReliabilityReview;
+let reviewExport=null,reviewExportCategory='all';
+function resetReviewExport() {
+ reviewExport=null;$('review-export-save').disabled=true;$('review-export-content').hidden=true;$('review-export-content').textContent='';$('review-export-saved').hidden=true;$('review-export-error').hidden=true;
+}
+$('review-export-open').onclick=()=>{
+ reviewExportCategory=$('review-filter').value;resetReviewExport();$('review-export-summary').textContent=`Selected category: ${reviewExportCategory}. Preview captures current data.`;$('review-export-dialog').showModal();
+};
+$('review-export-format').onchange=resetReviewExport;
+$('review-export-preview').onclick=async()=>{
+ resetReviewExport();$('review-export-preview').disabled=true;
+ try {
+  const format=$('review-export-format').value,result=await api('/api/reliability/export','POST',{format,category:reviewExportCategory});
+  if($('review-export-format').value!==format)return;
+  reviewExport=result;$('review-export-content').textContent=result.content;$('review-export-content').hidden=false;$('review-export-save').disabled=false;
+  $('review-export-summary').textContent=`${result.summary.services} services · ${result.summary.category} · evaluated ${date(result.summary.as_of)}`;
+ }catch(error){$('review-export-error').textContent=error.message;$('review-export-error').hidden=false;}
+ finally{$('review-export-preview').disabled=false;}
+};
+$('review-export-save').onclick=async()=>{
+ if(!reviewExport)return;const preview=reviewExport.preview_id;$('review-export-save').disabled=true;
+ try {
+  const saved=await api(`/api/exports/${preview}/save`,'POST',{});if(reviewExport?.preview_id!==preview)return;
+  $('review-export-saved').textContent=`Saved: ${saved.path} · ${saved.bytes} bytes · SHA-256: ${saved.sha256}`;$('review-export-saved').hidden=false;
+ }catch(error){$('review-export-error').textContent=error.message;$('review-export-error').hidden=false;}
+ finally{if(reviewExport?.preview_id===preview)$('review-export-save').disabled=false;}
+};
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
 setInterval(()=>{if(!document.hidden)refresh();},2000);

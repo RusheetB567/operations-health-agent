@@ -16,6 +16,15 @@ Configuration revisions and maintenance cycles keep unrelated observations separ
 
 Double-click `Start-SignalDesk.cmd`, open **Reliability**, set an objective and inspect **View history**. See [the initial Day 5 report](DAY-FIVE-REPORT.md) for objective calculations and [Day 5.2](DAY-5.2-REPORT.md) for trend and history behaviour.
 
-Final verification includes 361 repository tests, including 69 console integration tests, plus browser inspection of the working history interface. The SQLite concurrency regression tests remain included. Remote CI has not been run on these uncommitted changes.
+Final verification includes 377 repository tests, including 85 console integration tests, plus browser inspection of the working history interface. The SQLite concurrency regression tests remain included. Remote CI has not been run on these uncommitted changes.
 
 Day 5 is ready for the repository owner's review. Nothing was staged, committed or pushed.
+
+## Final increments
+
+- [5.3](DAY-5.3-REPORT.md): separate latency goals for successful probes with timing-coverage safeguards.
+- [5.4](DAY-5.4-REPORT.md): a filtered review connecting target misses, missing evidence and incident ownership.
+- [5.5](DAY-5.5-REPORT.md): deterministic timestamp-tie handling and CI settings that preserve all matrix results.
+- [5.6](DAY-5.6-REPORT.md): previewable, locally saved reliability handoffs with checksums.
+
+Final validation runs the full suite on Windows Python 3.11, 3.12 and 3.13. Generated handoffs remain local and Git-ignored. The work is ready for owner review; no automated staging, commits, pushes or merges were performed.

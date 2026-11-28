@@ -365,12 +365,15 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             extension,media_type="md","text/markdown"
         result={"filename":f"incident-{identity}.{extension}","media_type":media_type,"content":content,
                 "summary":{"state":incident["state"],"activity_entries":len(events),"evidence_entries":len(evidence),"notes_included":payload["include_notes"]}}
+        return self._cache_export(result)
+
+    def _cache_export(self, result, kind="incident"):
         with self.lock:
             preview_id=uuid.uuid4().hex
             self.export_previews={key:value for key,value in self.export_previews.items() if value["expires"]>time.monotonic()}
             while len(self.export_previews)>=8:
                 self.export_previews.pop(next(iter(self.export_previews)))
-            self.export_previews[preview_id]={"expires":time.monotonic()+900,"report":result.copy(),"saved":None}
+            self.export_previews[preview_id]={"expires":time.monotonic()+900,"report":result.copy(),"saved":None,"kind":kind}
             result["preview_id"]=preview_id
         return result
 
@@ -385,7 +388,8 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 raise RequestError("This preview expired. Preview the report again before saving.",410)
             if preview["saved"]:
                 return preview["saved"]
-            directory=self.root/"reports"/"incident-exports"
+            folder="reliability-exports" if preview.get("kind")=="reliability" else "incident-exports"
+            directory=self.root/"reports"/folder
             if (self.root/"reports").is_symlink() or directory.is_symlink() or not directory.resolve().is_relative_to(self.root):
                 raise RequestError("The local report folder must stay inside this repository.",409)
             directory.mkdir(parents=True,exist_ok=True)
@@ -567,6 +571,33 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             "scope":"Read-only review of saved objectives and retained sampled checks. Deferred items can still have unresolved incidents; meeting objectives does not close incidents."}
 
     # SQLite insertion order breaks timestamp ties; UUIDs are not chronological.
+    def export_reliability_review(self, payload):
+        categories={"all","action_required","evidence_needed","deferred","within_target"}
+        if set(payload)!={"format","category"} or payload.get("format") not in ("json","markdown") or not isinstance(payload.get("category"),str) or payload["category"] not in categories:
+            raise RequestError("Choose JSON or Markdown and a supported review category.")
+        review=self.reliability_review()
+        selected=[item for item in review["items"] if payload["category"]=="all" or item["category"]==payload["category"]]
+        objectives={service["id"]:service for service in review["reliability"]["services"]}
+        counts={key:sum(item["category"]==key for item in selected) for key in review["counts"]}
+        services=[{**item,"objective":objectives[item["id"]]} for item in selected]
+        report={"schema_version":1,"report_type":"reliability-review","as_of":review["as_of"],"category":payload["category"],
+            "counts":counts,"services":services,"scope":review["scope"],
+            "limitations":["Sampled checks, not continuous uptime or request-level availability.","Current configuration and maintenance cycle only; retained history is bounded to 200 runs.","Latency uses successful probes and complete valid timing coverage.","Incident ownership labels are local text; investigation notes and endpoint addresses are excluded."]}
+        if payload["format"]=="json":
+            content=json.dumps(report,indent=2,ensure_ascii=False)+"\n"
+            extension,media_type="json","application/json"
+        else:
+            lines=["# Reliability review","","Evaluated: "+report["as_of"],"","Category: "+payload["category"],"",f"Included services: {len(services)}","",review["scope"],"","## Limits",""]
+            lines.extend("- "+item for item in report["limitations"])
+            lines.extend(["","## Category counts","",*('    '+key+': '+str(value) for key,value in counts.items()),""])
+            for service in services:
+                # Literal blocks prevent user labels from becoming Markdown/HTML structure.
+                lines.extend(["## Service","",*("    "+line for line in json.dumps(service,indent=2,ensure_ascii=False).splitlines()),""])
+            content="\n".join(lines)
+            extension,media_type="md","text/markdown"
+        return self._cache_export({"filename":"reliability-review."+extension,"media_type":media_type,"content":content,
+            "summary":{"services":len(services),"category":payload["category"],"as_of":report["as_of"]}},kind="reliability")
+
     def reliability_history(self, service_id):
         from datetime import timedelta
         with self.db() as db:
@@ -948,6 +979,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(200,self.state.save_incident_export(path.split("/")[3],payload))
             if method == "POST" and path.startswith("/api/incidents/") and path.endswith("/export"):
                 return self.response(200,self.state.export_incident(path.split("/")[3],payload))
+            if method == "POST" and path == "/api/reliability/export":
+                return self.response(200,self.state.export_reliability_review(payload))
             if method == "POST" and path == "/api/runs/compare":
                 return self.response(200,self.state.compare_runs(payload))
             if method == "POST" and path == "/api/checks":

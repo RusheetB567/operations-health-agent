@@ -85,3 +85,7 @@ On Reliability, choose Latency goal to enable a threshold and target for success
 ## Reliability review
 
 On Reliability, filter the review panel to separate saved-target misses, missing evidence/settings, deferred work and services within saved targets. Open evidence, review an objective or follow an active incident link. The panel does not modify incident state, and unsaved defaults are not treated as committed targets. See [Day 5.4](DAY-5.4-REPORT.md).
+
+## Export a reliability handoff
+
+Filter the reliability review, choose Export this review, preview Markdown or JSON, then Save local snapshot. The exact preview is saved under reports/reliability-exports with a displayed checksum. Snapshots include target settings and evidence counts but exclude endpoint fields and investigation notes. The shared preview cache keeps eight previews for 15 minutes. See [Day 5.6](DAY-5.6-REPORT.md).
