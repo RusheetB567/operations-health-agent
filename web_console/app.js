@@ -4,6 +4,7 @@ const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let model = null, editing = null, deleting = null, loading = false, toastTimer;
 const titles = {
+ reliability: ['RELIABILITY OVER TIME', 'Turn observations into objectives.', 'Understand sampled health, evidence coverage and your failure allowance.', 'Reliability'],
  incidents: ['RESPOND WITH CONTEXT', 'Give every failure a clear next step.', 'Acknowledge failures, record your investigation and verify recovery.', 'Incidents'],
  overview: ['YOUR OPERATIONS, IN ONE PLACE', 'A clearer view of your services.', 'Check what’s running. Understand what isn’t. Keep the evidence.', 'Overview'],
  services: ['YOUR SERVICE LANDSCAPE', 'Every endpoint, accounted for.', 'Connect, pause and check the services running on this device.', 'Services'],
@@ -88,6 +89,7 @@ function navigate() {
  document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==`page-${view}`);
  document.querySelectorAll('[data-view]').forEach(b=>{b.classList.toggle('active',b.dataset.view===view); b.setAttribute('aria-current',b.dataset.view===view ? 'page' : 'false');});
  const t=titles[view]; ['page-eyebrow','page-title','page-subtitle','breadcrumb-label'].forEach((id,i)=>$(id).textContent=t[i]);
+ if(view==='reliability') loadReliability();
  if(view==='evidence') loadEvidence();
  if(view==='triage') api('/api/triage/latest').then(r=>renderTriage(r.summary)).catch(e=>toast(e.message,true));
 }
@@ -123,6 +125,9 @@ document.addEventListener('click',async event=>{
  if(d.incident) openIncident(d.incident);
  if(d.maintenance) openMaintenance(d.maintenance);
  if(d.endMaintenance) {if(await change(`/api/maintenance/${d.endMaintenance}/end`,'POST',{})) {toast('Maintenance ended. The next check can observe this service.');}}
+ if(d.reliabilityHistory) openReliabilityHistory(d.reliabilityHistory);
+ if(d.latency) openLatencyObjective(d.latency);
+ if(d.objective) openObjective(d.objective);
  if(d.edit) openService(d.edit);
  if(d.check) await change('/api/checks','POST',{service_ids:[d.check]});
  if(d.toggle) {
@@ -305,6 +310,73 @@ $('export-download').onclick=()=>{
  const link=document.createElement('a');link.href=url;link.download=incidentExport.filename;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
  toast('Report downloaded locally. Review it before sharing.');
 };
+let reliabilityData=null,reliabilityLoading=false,objectiveService=null;
+const objectiveLabels={met:'Meeting target',below_target:'Below target',insufficient_data:'Need more samples'};
+async function loadReliability() {
+ if(reliabilityLoading)return;reliabilityLoading=true;
+ try {
+  reliabilityReview=await api('/api/reliability/review');reliabilityData=reliabilityReview.reliability;renderReliabilityReview();const services=reliabilityData.services;
+  $('reliability-met').textContent=services.filter(s=>s.status==='met').length;
+  $('reliability-below').textContent=services.filter(s=>s.status==='below_target').length;
+  $('reliability-insufficient').textContent=services.filter(s=>s.status==='insufficient_data').length;
+  $('reliability-table').innerHTML=services.length ? `<div class="table-wrap"><table><thead><tr><th>Service</th><th>Objective</th><th>Observed healthy</th><th>Evidence</th><th>Remaining allowance</th><th>Availability assessment</th><th>Latency objective</th><th>Actions</th></tr></thead><tbody>${services.map(s=>`<tr><td><strong>${esc(s.name)}</strong><div class="muted">${esc(s.group)}${!s.enabled ? ' · paused' : s.maintenance ? ' · maintenance' : ''}</div></td><td>${s.target_percent}% over ${s.window_hours}h<div class="muted">${s.configured ? 'Saved objective' : 'Suggested default'}</div></td><td>${s.achieved_percent===null ? 'No observations' : `${s.achieved_percent}%`}</td><td>${s.healthy} healthy / ${s.samples} checks<div class="muted">Minimum ${s.min_samples}</div></td><td>${s.samples ? `${s.remaining_allowance} checks` : 'No allowance yet'}</td><td><span class="badge ${s.status}">${objectiveLabels[s.status]}</span></td><td>${s.latency.enabled ? `<span class="badge ${s.latency.status}">${objectiveLabels[s.latency.status]}</span><div>${s.latency.target_percent}% within ${s.latency.threshold_ms} ms</div><div class="muted">${s.latency.achieved_percent===null ? 'No timed successes' : `${s.latency.achieved_percent}% observed`} · ${s.latency.timed_healthy_checks}/${s.latency.healthy_checks} successes timed</div>` : 'Not enabled'}</td><td><div class="row-actions"><button class="text-button" data-reliability-history="${s.id}">View history</button><button class="text-button" data-objective="${s.id}">Set objective</button><button class="text-button" data-latency="${s.id}">Latency goal</button></div></td></tr>`).join('')}</tbody></table></div>` : empty('No services to evaluate','Add a local service or start the lab, then collect check observations.');
+  $('reliability-updated').textContent=`Evaluated ${date(reliabilityData.as_of)}. History retention is limited to 200 runs; sparse/manual checks may be unrepresentative.`;
+ }catch(error){$('reliability-table').innerHTML=empty('Could not load reliability',error.message);}
+ finally{reliabilityLoading=false;}
+}
+function openObjective(identity) {
+ const service=reliabilityData?.services.find(s=>s.id===identity);if(!service)return;
+ objectiveService=identity;$('objective-name').textContent=service.name;
+ $('objective-target').value=service.target_percent;$('objective-window').value=service.window_hours;$('objective-minimum').value=service.min_samples;
+ $('objective-error').hidden=true;$('objective-dialog').showModal();
+}
+$('objective-form').onsubmit=async event=>{
+ event.preventDefault();$('objective-save').disabled=true;
+ try {
+  await api(`/api/services/${objectiveService}/objective`,'PATCH',{target_percent:Number($('objective-target').value),window_hours:Number($('objective-window').value),min_samples:Number($('objective-minimum').value)});
+  $('objective-dialog').close();await loadReliability();toast('Service objective saved.');
+ }catch(error){$('objective-error').textContent=error.message;$('objective-error').hidden=false;}
+ finally{$('objective-save').disabled=false;}
+};
+$('reliability-refresh').onclick=loadReliability;
+setInterval(()=>{if(!document.hidden && location.hash==='#reliability')loadReliability();},10000);
+let historyRequest=0;
+async function openReliabilityHistory(identity) {
+ const request=++historyRequest;
+ $('history-title').textContent='Service history';$('history-content').textContent='Loading observations…';
+ if(!$('reliability-history-dialog').open)$('reliability-history-dialog').showModal();
+ try {
+  const h=await api(`/api/reliability/${identity}`);if(request!==historyRequest)return;
+  $('history-title').textContent=h.service.name;
+  const trend=h.trend.status==='insufficient_data' ? 'More observations needed for a trend' : `${h.trend.status}: ${h.trend.previous_percent}% to ${h.trend.recent_percent}% (${h.trend.difference_pp>0 ? '+' : ''}${h.trend.difference_pp} percentage points)`;
+  $('history-content').innerHTML=`<div class="notice info">${esc(h.scope)}</div><div class="history-metrics"><div><strong>${h.consecutive_warnings}</strong><span>Latest consecutive warnings</span></div><div><strong>${duration(h.p95_probe_ms)}</strong><span>P95 probe duration · ${h.timed_samples} timed checks</span></div></div><h3>Sampled health over ${h.service.window_hours} hours</h3><p class="small-note left">Twelve equal time buckets, oldest to newest. Empty buckets are gaps in evidence.</p><div class="history-chart" role="list" aria-label="Sampled healthy checks by time bucket">${h.buckets.map(b=>`<div class="history-bucket" role="listitem" aria-label="${esc(date(b.start))} to ${esc(date(b.end))}: ${b.samples ? `${b.healthy_percent}% healthy from ${b.samples} checks` : 'No observations'}"><div class="history-bar-track ${b.samples ? '' : 'no-data'}"><div style="height:${b.healthy_percent ?? 0}%"></div></div><strong>${b.samples ? `${Math.round(b.healthy_percent)}%` : 'Gap'}</strong><span>${b.samples} checks</span></div>`).join('')}</div><p class="small-note left">${date(h.buckets[0].start)} to ${date(h.buckets[11].end)}</p><h3>Recent sample trend</h3><p>${esc(trend)}</p><p class="small-note left">${h.trend.samples_per_group ? `Equal groups of ${h.trend.samples_per_group} observations, newest versus preceding. With an odd sample count, the oldest extra observation is omitted. Descriptive only; not a forecast.` : "At least six observations and the configured minimum are required. No trend is inferred from sparse evidence."}</p><h3>Latest observations</h3><p class="small-note left">Showing ${Math.min(50,h.observations.length)} of ${h.observations.length} matching observations. Probe duration includes process overhead. Close and reopen to refresh.</p>${h.observations.length ? `<div class="table-wrap"><table><thead><tr><th>Finished</th><th>Trigger</th><th>Health</th><th>Probe result</th><th>Duration</th></tr></thead><tbody>${h.observations.slice(0,50).map(o=>`<tr><td>${date(o.finished_at)}</td><td>${esc(o.source)}</td><td>${badge(o.status)}</td><td>${esc(o.probe_status || 'Not recorded')}${o.http_status ? ` · HTTP ${esc(o.http_status)}` : ''}</td><td>${duration(o.duration_ms)}</td></tr>`).join('')}</tbody></table></div>` : empty('No matching observations','Run checks for the current configuration to collect evidence.')}`;
+ }catch(error){if(request===historyRequest)$('history-content').textContent=error.message;}
+}
+let latencyService=null;
+function openLatencyObjective(identity) {
+ const service=reliabilityData?.services.find(s=>s.id===identity);if(!service)return;
+ latencyService=identity;$('latency-service-name').textContent=service.name;
+ $('latency-enabled').checked=service.latency.enabled;$('latency-threshold').value=service.latency.threshold_ms;$('latency-target').value=service.latency.target_percent;
+ $('latency-error').hidden=true;$('latency-dialog').showModal();
+}
+$('latency-form').onsubmit=async event=>{
+ event.preventDefault();$('latency-save').disabled=true;
+ try {
+  await api(`/api/services/${latencyService}/latency-objective`,'PATCH',{enabled:$('latency-enabled').checked,threshold_ms:Number($('latency-threshold').value),target_percent:Number($('latency-target').value)});
+  $('latency-dialog').close();await loadReliability();toast('Latency objective saved.');
+ }catch(error){$('latency-error').textContent=error.message;$('latency-error').hidden=false;}
+ finally{$('latency-save').disabled=false;}
+};
+let reliabilityReview=null;
+const reviewLabels={action_required:'Target miss',evidence_needed:'Evidence needed',deferred:'Deferred',within_target:'Within saved targets'};
+const reviewReasons={availability_objective_not_saved:'Save an availability objective; the default is only a suggestion.',availability_below_target:'Availability is below its saved target. Review warnings and compare check runs.',availability_needs_samples:'Collect the configured minimum of observations before assessing availability.',latency_below_target:'Successful probes are missing the saved latency target. Inspect probe timings.',latency_missing_timings:'Some successful checks lack valid timings; latency assessment is withheld.',latency_needs_samples:'Collect more successfully timed observations for the latency assessment.'};
+function renderReliabilityReview() {
+ if(!reliabilityReview)return;
+ const filter=$('review-filter').value,items=reliabilityReview.items.filter(item=>filter==='all' || item.category===filter),counts=reliabilityReview.counts;
+ $('review-counts').textContent=`${counts.action_required} target misses · ${counts.evidence_needed} need evidence/settings · ${counts.deferred} deferred · ${counts.within_target} within saved targets · ${date(reliabilityReview.as_of)}`;
+ $('review-items').innerHTML=items.length ? items.map(item=>`<article class="review-item"><div class="review-item-heading"><div><strong>${esc(item.name)}</strong><span class="muted">${esc(item.group)}</span></div><span class="badge ${item.category}">${reviewLabels[item.category]}</span></div>${item.deferred_reason ? `<p>${item.deferred_reason==='paused' ? 'Service is paused.' : 'Service is in maintenance.'} Historical assessments are retained; this is not a recovery.</p>` : ''}${item.reasons.map(reason=>`<p>${reviewReasons[reason]}</p>`).join('') || '<p>Saved objectives meet their required evidence and targets in retained observations.</p>'}<div class="review-item-actions"><button class="text-button" data-reliability-history="${item.id}">View evidence</button><button class="text-button" data-objective="${item.id}">Review objective</button>${item.incidents.slice(0,3).map(incident=>`<button class="text-button" data-incident="${incident.id}">Open incident · ${esc(incident.owner || 'Unassigned')}</button>`).join('')}</div><p class="small-note left">${item.samples} matching checks · ${item.incidents.length} active incident${item.incidents.length===1 ? '' : 's'}</p></article>`).join('') : empty('No services in this review category','Choose another filter to inspect the remaining services.');
+}
+$('review-filter').onchange=renderReliabilityReview;
 window.addEventListener('hashchange',navigate);
 navigate();refresh();
 setInterval(()=>{if(!document.hidden)refresh();},2000);

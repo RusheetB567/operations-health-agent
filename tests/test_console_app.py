@@ -733,5 +733,392 @@ class ConsoleTests(unittest.TestCase):
             self.state.save_incident_export(original['preview_id'],{})
 
 
+    def test_run_polling_waits_for_result_transaction(self):
+        self.stop_scheduler_thread()
+        original_lock=self.state.lock
+        attempting,completed=threading.Event(),threading.Event()
+        failures=[]
+        results=[]
+        reader=None
+        class ObservedLock:
+            def __enter__(inner):
+                if threading.current_thread() is reader:
+                    attempting.set()
+                original_lock.acquire()
+                return inner
+            def __exit__(inner,*args):
+                original_lock.release()
+        self.state.lock=ObservedLock()
+        def poll():
+            try:
+                results.extend(self.state.runs())
+            except Exception as error:
+                failures.append(error)
+            finally:
+                completed.set()
+        try:
+            with self.state.db() as db:
+                db.execute("INSERT INTO runs(id,state,started_at) VALUES('pending-write','completed',?)",(now(),))
+                reader=threading.Thread(target=poll)
+                reader.start()
+                self.assertTrue(attempting.wait(3),'Polling must enter the shared database guard')
+                self.assertFalse(completed.is_set(),'Polling must wait for the transaction to commit')
+            reader.join(3)
+            self.assertFalse(reader.is_alive())
+            self.assertEqual(failures,[])
+            self.assertEqual(results[0]['id'],'pending-write')
+        finally:
+            if reader is not None:
+                reader.join(3)
+            self.state.lock=original_lock
+
+    def test_rollback_releases_database_guard_for_other_threads(self):
+        self.stop_scheduler_thread()
+        with self.assertRaises(RuntimeError):
+            with self.state.db() as db:
+                db.execute("INSERT INTO runs(id,state,started_at) VALUES('rolled-back','queued',?)",(now(),))
+                raise RuntimeError('simulated transaction failure')
+        outcome=[]
+        reader=threading.Thread(target=lambda:outcome.extend(self.state.runs()))
+        reader.start();reader.join(3)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(outcome,[])
+
+
+    def reliability_samples(self, healthy=4, total=5):
+        import uuid
+        from datetime import datetime,timedelta,timezone
+        base=datetime.now(timezone.utc)-timedelta(seconds=total)
+        identity=self.state.save_service(self.service())['id']
+        with self.state.db() as db:
+            for index in range(total):
+                run_id=uuid.uuid4().hex
+                timestamp=(base+timedelta(seconds=index)).isoformat()
+                db.execute("INSERT INTO runs(id,state,started_at,finished_at) VALUES(?,'completed',?,?)",(run_id,timestamp,timestamp))
+                payload=json.dumps({'status':'healthy' if index<healthy else 'warning'})
+                db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,1,?,0)',(run_id,identity,payload))
+        return identity
+
+    def test_reliability_defaults_require_evidence(self):
+        identity=self.state.save_service(self.service())['id']
+        code,result,_=self.request('/api/reliability')
+        self.assertEqual(code,200)
+        service=result['services'][0]
+        self.assertEqual(service['status'],'insufficient_data')
+        self.assertFalse(service['configured'])
+        self.assertIsNone(service['achieved_percent'])
+        self.assertEqual(service['samples'],0)
+        self.assertIsNone(service['last_checked_at'])
+
+    def test_objective_boundary_and_failure_allowance(self):
+        identity=self.reliability_samples()
+        self.state.save_objective(identity,{'target_percent':80,'window_hours':24,'min_samples':5})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'met')
+        self.assertEqual(service['achieved_percent'],80)
+        self.assertEqual(service['failure_allowance'],1)
+        self.assertEqual(service['remaining_allowance'],0)
+        self.state.save_objective(identity,{'target_percent':99,'window_hours':24,'min_samples':5})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'below_target')
+        self.assertEqual(service['remaining_allowance'],-.95)
+
+    def test_perfect_target_and_insufficient_sample_guard(self):
+        identity=self.reliability_samples(healthy=5)
+        self.state.save_objective(identity,{'target_percent':100,'window_hours':24,'min_samples':5})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'met')
+        self.assertEqual(service['remaining_allowance'],0)
+        self.state.save_objective(identity,{'target_percent':100,'window_hours':24,'min_samples':10})
+        self.assertEqual(self.state.reliability()['services'][0]['status'],'insufficient_data')
+        self.assertNotIn('NaN',json.dumps(self.state.reliability(),allow_nan=False))
+
+    def test_objectives_validate_and_persist(self):
+        identity=self.reliability_samples()
+        route=f'/api/services/{identity}/objective'
+        valid={'target_percent':95,'window_hours':48,'min_samples':5}
+        self.assertEqual(self.request(route,'PATCH',valid,{'X-Console-Token':''})[0],403)
+        for changes in ({'target_percent':True},{'target_percent':49},{'target_percent':101},{'target_percent':float('nan')},{'window_hours':0},{'window_hours':169},{'window_hours':1.5},{'min_samples':4},{'min_samples':201},{'min_samples':True},{'extra':1}):
+            self.assertEqual(self.request(route,'PATCH',{**valid,**changes})[0],400,changes)
+        self.assertEqual(self.request('/api/services/missing/objective','PATCH',valid)[0],404)
+        self.assertEqual(self.request(route,'PATCH',valid)[0],200)
+        restarted=ConsoleState(self.root)
+        try:
+            service=restarted.reliability()['services'][0]
+            self.assertTrue(service['configured'])
+            self.assertEqual(service['window_hours'],48)
+            self.assertEqual(service['target_percent'],95)
+        finally:
+            restarted.close()
+
+    def test_reliability_excludes_old_and_reconfigured_observations(self):
+        from datetime import datetime,timedelta,timezone
+        identity=self.reliability_samples()
+        with self.state.db() as db:
+            old=(datetime.now(timezone.utc)-timedelta(hours=25)).isoformat()
+            db.execute('UPDATE runs SET finished_at=? WHERE id=(SELECT run_id FROM observations LIMIT 1)',(old,))
+        self.assertEqual(self.state.reliability()['services'][0]['samples'],4)
+        payload=self.service();payload['expected_status']=204
+        self.state.save_service(payload,identity)
+        self.assertEqual(self.state.reliability()['services'][0]['samples'],0)
+
+    def test_pause_preserves_samples_and_maintenance_starts_fresh_cycle(self):
+        identity=self.reliability_samples()
+        payload=self.service();payload['enabled']=False
+        self.state.save_service(payload,identity)
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['samples'],5)
+        self.assertFalse(service['enabled'])
+        self.state.start_maintenance(identity,{'duration_minutes':5,'reason':'Upgrade'})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['samples'],0)
+        self.assertTrue(service['maintenance'])
+
+
+    def test_history_missing_service_and_empty_evidence(self):
+        self.assertEqual(self.request('/api/reliability/missing')[0],404)
+        identity=self.state.save_service(self.service())['id']
+        code,history,_=self.request('/api/reliability/'+identity)
+        self.assertEqual(code,200)
+        self.assertEqual(history['observations'],[])
+        self.assertEqual(history['trend']['status'],'insufficient_data')
+        self.assertIsNone(history['p95_probe_ms'])
+        self.assertTrue(all(b['healthy_percent'] is None for b in history['buckets']))
+
+    def test_history_buckets_preserve_gaps_and_sample_counts(self):
+        identity=self.reliability_samples(healthy=3,total=6)
+        history=self.state.reliability_history(identity)
+        self.assertEqual(len(history['buckets']),12)
+        self.assertEqual(sum(b['samples'] for b in history['buckets']),6)
+        nonempty=[b for b in history['buckets'] if b['samples']]
+        self.assertEqual(len(nonempty),1)
+        self.assertEqual(nonempty[0]['healthy_percent'],50)
+        self.assertEqual(history['service']['samples'],len(history['observations']))
+        self.assertEqual(history['consecutive_warnings'],3)
+
+    def test_history_trend_decline_and_improvement(self):
+        identity=self.reliability_samples(healthy=3,total=6)
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        history=self.state.reliability_history(identity)
+        self.assertEqual(history['trend']['status'],'declining')
+        self.assertEqual(history['trend']['difference_pp'],-100)
+        with self.state.db() as db:
+            for item in history['observations']:
+                db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps({'status':'warning' if item['status']=='healthy' else 'healthy'}),item['run_id']))
+        updated=self.state.reliability_history(identity)
+        self.assertEqual(updated['trend']['status'],'improving')
+        self.assertEqual(updated['trend']['difference_pp'],100)
+        self.assertEqual(updated['consecutive_warnings'],0)
+
+    def test_history_trend_minimum_and_odd_count(self):
+        identity=self.reliability_samples(healthy=3,total=7)
+        self.assertEqual(self.state.reliability_history(identity)['trend']['status'],'insufficient_data')
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        trend=self.state.reliability_history(identity)['trend']
+        self.assertEqual(trend['samples_per_group'],3)
+        self.assertEqual(trend['recent_percent'],0)
+        self.assertAlmostEqual(trend['previous_percent'],66.6667)
+
+    def test_history_timing_validation_and_field_whitelist(self):
+        identity=self.reliability_samples(healthy=5,total=5)
+        history=self.state.reliability_history(identity)
+        with self.state.db() as db:
+            for item,value in zip(history['observations'],[True,-1,3,4,100]):
+                payload={'status':'healthy','detail':{'status':'ready','duration_ms':value,'raw_message':'PRIVATE_MARKER'}}
+                db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),item['run_id']))
+        result=self.state.reliability_history(identity)
+        self.assertEqual(result['timed_samples'],3)
+        self.assertEqual(result['p95_probe_ms'],100)
+        self.assertNotIn('PRIVATE_MARKER',json.dumps(result))
+
+    def test_history_scope_and_read_only_behaviour(self):
+        identity=self.reliability_samples()
+        with self.state.db() as db:
+            before='\n'.join(db.iterdump())
+        self.state.reliability_history(identity)
+        with self.state.db() as db:
+            self.assertEqual('\n'.join(db.iterdump()),before)
+        self.state.start_maintenance(identity,{'duration_minutes':5,'reason':'New cycle'})
+        self.assertEqual(self.state.reliability_history(identity)['observations'],[])
+        payload=self.service();payload['expected_status']=204
+        self.state.save_service(payload,identity)
+        self.assertEqual(self.state.reliability_history(identity)['observations'],[])
+
+
+    def latency_fixture(self, healthy=5,total=6):
+        identity=self.reliability_samples(healthy=healthy,total=total)
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        with self.state.db() as db:
+            index=0
+            for row in db.execute('SELECT run_id,payload FROM observations WHERE service_id=? ORDER BY run_id',(identity,)).fetchall():
+                payload=json.loads(row['payload'])
+                payload['detail']={'duration_ms':[100,100,100,500,700][index%5] if payload['status']=='healthy' else 1}
+                index+=int(payload['status']=='healthy')
+                db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),row['run_id']))
+        return identity
+
+    def test_latency_boundary_and_fast_failure_exclusion(self):
+        identity=self.latency_fixture()
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':500,'target_percent':80})
+        service=self.state.reliability()['services'][0]
+        self.assertEqual(service['status'],'below_target')
+        self.assertEqual(service['latency']['status'],'met')
+        self.assertEqual(service['latency']['timed_healthy_checks'],5)
+        self.assertEqual(service['latency']['within_threshold'],4)
+        self.assertEqual(service['latency']['achieved_percent'],80)
+        self.assertEqual(service['latency']['p95_healthy_probe_ms'],700)
+
+    def test_fast_failed_probes_cannot_meet_latency_objective(self):
+        identity=self.latency_fixture(healthy=0,total=6)
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':500,'target_percent':95})
+        latency=self.state.reliability()['services'][0]['latency']
+        self.assertEqual(latency['status'],'insufficient_data')
+        self.assertEqual(latency['timed_healthy_checks'],0)
+        self.assertIsNone(latency['achieved_percent'])
+
+    def test_missing_or_invalid_healthy_timing_withholds_assessment(self):
+        identity=self.latency_fixture(healthy=6,total=6)
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':1000,'target_percent':100})
+        with self.state.db() as db:
+            row=db.execute('SELECT run_id,payload FROM observations WHERE service_id=? LIMIT 1',(identity,)).fetchone()
+            payload=json.loads(row['payload']);payload['detail']['duration_ms']=True
+            db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),row['run_id']))
+        latency=self.state.reliability()['services'][0]['latency']
+        self.assertEqual(latency['timed_healthy_checks'],5)
+        self.assertEqual(latency['missing_healthy_timings'],1)
+        self.assertEqual(latency['status'],'insufficient_data')
+
+    def test_latency_persistence_disable_and_maintenance_scope(self):
+        identity=self.latency_fixture()
+        settings={'enabled':True,'threshold_ms':250,'target_percent':90}
+        self.assertEqual(self.request(f'/api/services/{identity}/latency-objective','PATCH',settings)[0],200)
+        restarted=ConsoleState(self.root)
+        try:
+            latency=restarted.reliability()['services'][0]['latency']
+            self.assertTrue(latency['enabled'])
+            self.assertEqual(latency['threshold_ms'],250)
+            self.assertEqual(latency['status'],'below_target')
+        finally:
+            restarted.close()
+        self.state.start_maintenance(identity,{'duration_minutes':1,'reason':'Fresh cycle'})
+        self.assertEqual(self.state.reliability()['services'][0]['latency']['timed_healthy_checks'],0)
+        self.state.save_latency_objective(identity,{**settings,'enabled':False})
+        self.assertEqual(self.state.reliability()['services'][0]['latency']['status'],'not_enabled')
+
+    def test_latency_input_validation_and_request_protection(self):
+        identity=self.latency_fixture()
+        route=f'/api/services/{identity}/latency-objective'
+        valid={'enabled':True,'threshold_ms':500,'target_percent':95}
+        self.assertEqual(self.request(route,'PATCH',valid,{'X-Console-Token':''})[0],403)
+        for changes in ({'enabled':1},{'threshold_ms':True},{'threshold_ms':0},{'threshold_ms':60001},{'threshold_ms':1.5},{'target_percent':float('nan')},{'target_percent':True},{'target_percent':49},{'target_percent':101},{'extra':1}):
+            self.assertEqual(self.request(route,'PATCH',{**valid,**changes})[0],400,changes)
+        self.assertEqual(self.request('/api/services/missing/latency-objective','PATCH',valid)[0],404)
+        self.assertFalse(self.state.reliability()['services'][0]['latency']['enabled'])
+
+
+    def test_review_defaults_are_not_committed_targets(self):
+        identity=self.reliability_samples(healthy=0,total=12)
+        code,review,_=self.request('/api/reliability/review')
+        self.assertEqual(code,200)
+        item=review['items'][0]
+        self.assertEqual(item['id'],identity)
+        self.assertEqual(item['category'],'evidence_needed')
+        self.assertIn('availability_objective_not_saved',item['reasons'])
+        self.assertNotIn('availability_below_target',item['reasons'])
+
+    def test_review_saved_targets_and_counts(self):
+        identity=self.reliability_samples()
+        settings={'target_percent':80,'window_hours':24,'min_samples':5}
+        self.state.save_objective(identity,settings)
+        review=self.state.reliability_review()
+        self.assertEqual(review['items'][0]['category'],'within_target')
+        self.assertEqual(review['counts']['within_target'],1)
+        self.state.save_objective(identity,{**settings,'target_percent':95})
+        review=self.state.reliability_review()
+        self.assertEqual(review['items'][0]['category'],'action_required')
+        self.assertIn('availability_below_target',review['items'][0]['reasons'])
+        self.assertEqual(sum(review['counts'].values()),1)
+
+    def test_review_latency_miss_and_missing_evidence_are_distinct(self):
+        identity=self.latency_fixture()
+        self.state.save_objective(identity,{'target_percent':80,'window_hours':24,'min_samples':5})
+        self.state.save_latency_objective(identity,{'enabled':True,'threshold_ms':500,'target_percent':90})
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'action_required')
+        self.assertEqual(item['reasons'],['latency_below_target'])
+        with self.state.db() as db:
+            for row in db.execute('SELECT run_id,payload FROM observations WHERE service_id=?',(identity,)).fetchall():
+                payload=json.loads(row['payload'])
+                if payload['status']=='healthy':
+                    payload['detail']['duration_ms']=None
+                    db.execute('UPDATE observations SET payload=? WHERE run_id=?',(json.dumps(payload),row['run_id']))
+                    break
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'evidence_needed')
+        self.assertIn('latency_missing_timings',item['reasons'])
+
+    def test_review_paused_and_maintenance_services_are_deferred(self):
+        identity=self.reliability_samples()
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        payload=self.service();payload['enabled']=False
+        self.state.save_service(payload,identity)
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'deferred')
+        self.assertEqual(item['deferred_reason'],'paused')
+        self.assertIn('availability_below_target',item['reasons'])
+        payload['enabled']=True
+        self.state.save_service(payload,identity)
+        self.state.start_maintenance(identity,{'duration_minutes':5,'reason':'Upgrade'})
+        item=self.state.reliability_review()['items'][0]
+        self.assertEqual(item['category'],'deferred')
+        self.assertEqual(item['deferred_reason'],'maintenance')
+
+    def test_review_links_incident_ownership_without_mutation_or_notes(self):
+        incident=self.lab_incident()
+        self.state.update_incident(incident['id'],{'version':incident['version'],'action':'acknowledge','owner':'Platform team','note':'PRIVATE_INVESTIGATION_NOTE'})
+        with self.state.db() as db:
+            before='\n'.join(db.iterdump())
+        review=self.state.reliability_review()
+        item=next(item for item in review['items'] if item['id']==incident['service_id'])
+        self.assertEqual(item['incidents'][0]['id'],incident['id'])
+        self.assertEqual(item['incidents'][0]['owner'],'Platform team')
+        self.assertNotIn('PRIVATE_INVESTIGATION_NOTE',json.dumps(review))
+        with self.state.db() as db:
+            self.assertEqual('\n'.join(db.iterdump()),before)
+
+
+    def test_equal_timestamps_preserve_observation_order(self):
+        identity=self.state.save_service(self.service())['id']
+        self.state.save_objective(identity,{'target_percent':95,'window_hours':24,'min_samples':5})
+        timestamp=now()
+        with self.state.db() as db:
+            for index in range(6):
+                run_id=f'tied-{6-index}'  # Deliberately opposite to insertion order.
+                payload=json.dumps({'status':'healthy' if index<3 else 'warning','detail':{}})
+                db.execute("INSERT INTO runs(id,state,started_at,finished_at) VALUES(?,'completed',?,?)",(run_id,timestamp,timestamp))
+                db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,1,?,0)',(run_id,identity,payload))
+        history=self.state.reliability_history(identity)
+        self.assertEqual([item['run_id'] for item in history['observations']],['tied-1','tied-2','tied-3','tied-4','tied-5','tied-6'])
+        self.assertEqual(history['consecutive_warnings'],3)
+        self.assertEqual(history['trend']['status'],'declining')
+        self.assertEqual(history['trend']['difference_pp'],-100)
+        self.assertEqual(self.state.services()[0]['last']['status'],'warning')
+        self.assertEqual(self.state.runs()[0]['id'],'tied-1')
+
+    def test_equal_timestamp_history_survives_database_restart(self):
+        identity=self.state.save_service(self.service())['id']
+        timestamp=now()
+        with self.state.db() as db:
+            for run_id,status in (('z-first','warning'),('a-second','healthy')):
+                db.execute("INSERT INTO runs(id,state,started_at,finished_at) VALUES(?,'completed',?,?)",(run_id,timestamp,timestamp))
+                db.execute('INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,1,?,0)',(run_id,identity,json.dumps({'status':status,'detail':{}})))
+        restarted=ConsoleState(self.root)
+        try:
+            self.assertEqual(restarted.reliability_history(identity)['observations'][0]['run_id'],'a-second')
+            self.assertEqual(restarted.services()[0]['last']['status'],'healthy')
+        finally:
+            restarted.close()
+
+
 if __name__ == '__main__':
     unittest.main()

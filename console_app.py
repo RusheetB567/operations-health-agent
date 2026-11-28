@@ -112,6 +112,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_active_incident ON incidents(service_id,re
 CREATE TABLE IF NOT EXISTS incident_events(id INTEGER PRIMARY KEY AUTOINCREMENT,incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,kind TEXT NOT NULL,created_at TEXT NOT NULL,detail TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS console_settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS maintenance(id TEXT PRIMARY KEY,service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,reason TEXT NOT NULL,started_at REAL NOT NULL,expires_at REAL NOT NULL,ended_at REAL);
+CREATE TABLE IF NOT EXISTS objectives(service_id TEXT PRIMARY KEY REFERENCES services(id) ON DELETE CASCADE,target_percent REAL NOT NULL,window_hours INTEGER NOT NULL,min_samples INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS latency_objectives(service_id TEXT PRIMARY KEY REFERENCES services(id) ON DELETE CASCADE,enabled INTEGER NOT NULL,threshold_ms INTEGER NOT NULL,target_percent REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,summary TEXT NOT NULL);
 ''')
             for table in ("services", "observations"):
@@ -175,14 +177,18 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
 
     @contextmanager
     def db(self):
-        connection = sqlite3.connect(self.db_path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys=ON")
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        # HTTP handlers, scheduler and check workers share this database. Serialize
+        # connection lifetimes so polling cannot compete with a result commit on
+        # Windows. Reuse the RLock to preserve the ordering of nested state calls.
+        with self.lock:
+            connection = sqlite3.connect(self.db_path, timeout=5)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+                with connection:
+                    yield connection
+            finally:
+                connection.close()
 
     def close(self):
         with self.lock:
@@ -198,7 +204,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
             rows = db.execute("SELECT * FROM services ORDER BY created_at,id").fetchall()
             results = []
             for row in rows:
-                last = db.execute("SELECT o.payload,r.finished_at FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' ORDER BY r.finished_at DESC LIMIT 1", (row["id"], row["revision"], row["maintenance_version"])).fetchone()
+                last = db.execute("SELECT o.payload,r.finished_at FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 1", (row["id"], row["revision"], row["maintenance_version"])).fetchone()
                 value = {"id": row["id"], "name": row["name"], "group": row["group_name"], "type": row["protocol"],
                          "target": row["target"], "timeout": row["timeout"], "expected_status": row["expected_status"],
                          "enabled": bool(row["enabled"]), "is_demo": bool(row["is_demo"]), "revision": row["revision"],
@@ -325,7 +331,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 raise RequestError("Incident not found; it may have expired from history.",404)
             incident=dict(row)
             events=[dict(item) for item in db.execute("SELECT kind,created_at,detail FROM incident_events WHERE incident_id=? ORDER BY id LIMIT 200",(identity,)) if payload["include_notes"] or item["kind"] != "note"]
-            records=db.execute("SELECT r.id,r.finished_at,r.source,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND r.state='completed' AND r.finished_at>=? AND r.started_at<=? ORDER BY r.finished_at DESC LIMIT 101",(incident["service_id"],incident["revision"],incident["opened_at"],incident["resolved_at"] or now())).fetchall()
+            records=db.execute("SELECT r.id,r.finished_at,r.source,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND r.state='completed' AND r.finished_at>=? AND r.started_at<=? ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 101",(incident["service_id"],incident["revision"],incident["opened_at"],incident["resolved_at"] or now())).fetchall()
         evidence=[]
         for item in reversed(records[:100]):
             result=json.loads(item["payload"])
@@ -449,9 +455,169 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                 self._incident_event(db, identity, "note", note)
         return {"updated": True}
 
+    def save_objective(self, service_id, payload):
+        if set(payload) != {"target_percent","window_hours","min_samples"}:
+            raise RequestError("Provide target_percent, window_hours and min_samples.")
+        target,hours,minimum=payload["target_percent"],payload["window_hours"],payload["min_samples"]
+        if type(target) not in (int,float) or not math.isfinite(target) or not 50 <= target <= 100:
+            raise RequestError("Target must be a finite percentage from 50 to 100.")
+        if type(hours) is not int or not 1 <= hours <= 168:
+            raise RequestError("Choose a window of 1–168 whole hours.")
+        if type(minimum) is not int or not 5 <= minimum <= 200:
+            raise RequestError("Choose a minimum of 5–200 observations.")
+        with self.db() as db:
+            if not db.execute("SELECT 1 FROM services WHERE id=?",(service_id,)).fetchone():
+                raise RequestError("Service not found.",404)
+            db.execute("INSERT INTO objectives VALUES(?,?,?,?) ON CONFLICT(service_id) DO UPDATE SET target_percent=excluded.target_percent,window_hours=excluded.window_hours,min_samples=excluded.min_samples",(service_id,target,hours,minimum))
+        return {"saved":True}
+
+    def save_latency_objective(self, service_id, payload):
+        if set(payload) != {"enabled","threshold_ms","target_percent"} or type(payload.get("enabled")) is not bool:
+            raise RequestError("Provide enabled, threshold_ms and target_percent.")
+        threshold,target=payload["threshold_ms"],payload["target_percent"]
+        if type(threshold) is not int or not 1 <= threshold <= 60000:
+            raise RequestError("Choose a threshold of 1–60,000 whole milliseconds.")
+        if type(target) not in (int,float) or not math.isfinite(target) or not 50 <= target <= 100:
+            raise RequestError("Latency target must be a finite percentage from 50 to 100.")
+        with self.db() as db:
+            if not db.execute("SELECT 1 FROM services WHERE id=?",(service_id,)).fetchone():
+                raise RequestError("Service not found.",404)
+            db.execute("INSERT INTO latency_objectives VALUES(?,?,?,?) ON CONFLICT(service_id) DO UPDATE SET enabled=excluded.enabled,threshold_ms=excluded.threshold_ms,target_percent=excluded.target_percent",(service_id,int(payload["enabled"]),threshold,target))
+        return {"saved":True}
+
+    def reliability(self):
+        from datetime import timedelta
+        as_of=datetime.now(timezone.utc)
+        result=[]
+        # One consistent snapshot for settings, configuration and retained observations.
+        with self.db() as db:
+            db.execute("BEGIN")
+            services=self.services()
+            for service in services:
+                saved=db.execute("SELECT * FROM objectives WHERE service_id=?",(service["id"],)).fetchone()
+                target=saved["target_percent"] if saved else 99
+                hours=saved["window_hours"] if saved else 24
+                minimum=saved["min_samples"] if saved else 10
+                cutoff=(as_of-timedelta(hours=hours)).isoformat()
+                rows=db.execute("SELECT r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 200",(service["id"],service["revision"],service["maintenance_version"],cutoff,as_of.isoformat())).fetchall()
+                states=[json.loads(row["payload"]).get("status") for row in rows]
+                healthy=states.count("healthy")
+                total=len(states)
+                failures=total-healthy
+                achieved=healthy/total*100 if total else None
+                allowance=total*(1-target/100)
+                status="insufficient_data" if total<minimum else "met" if achieved>=target else "below_target"
+                latency_saved=db.execute("SELECT * FROM latency_objectives WHERE service_id=?",(service["id"],)).fetchone()
+                latency_enabled=bool(latency_saved and latency_saved["enabled"])
+                threshold=latency_saved["threshold_ms"] if latency_saved else 500
+                latency_target=latency_saved["target_percent"] if latency_saved else 95
+                healthy_timings=[]
+                for row in rows:
+                    observation=json.loads(row["payload"])
+                    timing=observation.get("detail",{}).get("duration_ms")
+                    if observation.get("status")=="healthy" and type(timing) in (int,float) and math.isfinite(timing) and timing>=0:
+                        healthy_timings.append(timing)
+                within=sum(value<=threshold for value in healthy_timings)
+                timed=len(healthy_timings)
+                missing=healthy-timed
+                latency_achieved=within/timed*100 if timed else None
+                latency_status="not_enabled" if not latency_enabled else "insufficient_data" if timed<minimum or missing else "met" if latency_achieved>=latency_target else "below_target"
+                ordered=sorted(healthy_timings)
+                latency={"enabled":latency_enabled,"threshold_ms":threshold,"target_percent":latency_target,"status":latency_status,
+                    "healthy_checks":healthy,"timed_healthy_checks":timed,"missing_healthy_timings":missing,"within_threshold":within,
+                    "achieved_percent":round(latency_achieved,4) if latency_achieved is not None else None,
+                    "p95_healthy_probe_ms":ordered[math.ceil(timed*.95)-1] if timed else None}
+                result.append({"id":service["id"],"name":service["name"],"group":service["group"],"enabled":service["enabled"],"maintenance":bool(service["maintenance"]),
+                               "latency":latency,"configured":saved is not None,"target_percent":target,"window_hours":hours,"min_samples":minimum,"samples":total,"healthy":healthy,"failures":failures,
+                               "achieved_percent":round(achieved,4) if achieved is not None else None,"failure_allowance":round(allowance,6),
+                               "remaining_allowance":round(allowance-failures,6),"status":status,"last_checked_at":rows[0]["finished_at"] if rows else None})
+        return {"as_of":as_of.isoformat(),"services":result,"scope":"Sampled completed checks from retained history for the current configuration and maintenance cycle. This is not continuous uptime or request-level availability."}
+
+    def reliability_review(self):
+        # Keep objective assessment and incident ownership within one database view.
+        with self.db() as db:
+            db.execute("BEGIN")
+            report=self.reliability()
+            incidents=[dict(row) for row in db.execute("SELECT id,service_id,state,owner FROM incidents WHERE state IN ('open','acknowledged') ORDER BY opened_at DESC,id")]
+        items=[]
+        counts={key:0 for key in ("action_required","evidence_needed","deferred","within_target")}
+        for service in report["services"]:
+            reasons=[]
+            if not service["configured"]:
+                reasons.append("availability_objective_not_saved")
+            elif service["status"]=="below_target":
+                reasons.append("availability_below_target")
+            if service["status"]=="insufficient_data":
+                reasons.append("availability_needs_samples")
+            latency=service["latency"]
+            if latency["enabled"]:
+                if latency["status"]=="below_target":
+                    reasons.append("latency_below_target")
+                elif latency["status"]=="insufficient_data":
+                    reasons.append("latency_missing_timings" if latency["missing_healthy_timings"] else "latency_needs_samples")
+            breached=any(reason.endswith("below_target") for reason in reasons)
+            deferred="paused" if not service["enabled"] else "maintenance" if service["maintenance"] else None
+            category="deferred" if deferred else "action_required" if breached else "evidence_needed" if reasons else "within_target"
+            counts[category]+=1
+            items.append({"id":service["id"],"name":service["name"],"group":service["group"],"category":category,"reasons":reasons,
+                "deferred_reason":deferred,"incidents":[item for item in incidents if item["service_id"]==service["id"]],
+                "availability_status":service["status"],"latency_status":latency["status"],"samples":service["samples"]})
+        rank={key:index for index,key in enumerate(counts)}
+        return {"as_of":report["as_of"],"reliability":report,"counts":counts,"items":sorted(items,key=lambda item:(rank[item["category"]],item["name"],item["id"])),
+            "scope":"Read-only review of saved objectives and retained sampled checks. Deferred items can still have unresolved incidents; meeting objectives does not close incidents."}
+
+    # SQLite insertion order breaks timestamp ties; UUIDs are not chronological.
+    def reliability_history(self, service_id):
+        from datetime import timedelta
+        with self.db() as db:
+            db.execute("BEGIN")
+            service=next((s for s in self.services() if s["id"]==service_id),None)
+            if service is None:
+                raise RequestError("Service not found.",404)
+            report=self.reliability()
+            objective=next(s for s in report["services"] if s["id"]==service_id)
+            end=datetime.fromisoformat(report["as_of"])
+            start=end-timedelta(hours=objective["window_hours"])
+            rows=db.execute("SELECT r.id,r.source,r.finished_at,o.payload FROM observations o JOIN runs r ON r.id=o.run_id WHERE o.service_id=? AND o.revision=? AND o.maintenance_version=? AND r.state='completed' AND r.finished_at>=? AND r.finished_at<=? ORDER BY r.finished_at DESC,r.rowid DESC LIMIT 200",(service_id,service["revision"],service["maintenance_version"],start.isoformat(),end.isoformat())).fetchall()
+        observations=[]
+        for row in rows:
+            value=json.loads(row["payload"])
+            detail=value.get("detail",{})
+            duration=detail.get("duration_ms")
+            observations.append({"run_id":row["id"],"source":row["source"],"finished_at":row["finished_at"],"status":value.get("status"),
+                "probe_status":detail.get("status"),"http_status":detail.get("http_status"),
+                "duration_ms":duration if type(duration) in (int,float) and math.isfinite(duration) and duration>=0 else None})
+        states=[item["status"] for item in observations]
+        streak=0
+        for state in states:
+            if state=="healthy":
+                break
+            streak+=1
+        measured=sorted(item["duration_ms"] for item in observations if item["duration_ms"] is not None)
+        trend={"status":"insufficient_data","samples_per_group":0,"previous_percent":None,"recent_percent":None,"difference_pp":None}
+        if len(states)>=max(6,objective["min_samples"]):
+            half=len(states)//2
+            recent=states[:half].count("healthy")/half*100
+            previous=states[half:half*2].count("healthy")/half*100
+            delta=recent-previous
+            trend={"status":"improving" if delta>0 else "declining" if delta<0 else "unchanged","samples_per_group":half,
+                "previous_percent":round(previous,4),"recent_percent":round(recent,4),"difference_pp":round(delta,4)}
+        width=objective["window_hours"]*3600/12
+        buckets=[{"start":(start+timedelta(seconds=width*i)).isoformat(),"end":(start+timedelta(seconds=width*(i+1))).isoformat(),"samples":0,"healthy":0,"healthy_percent":None} for i in range(12)]
+        for item in observations:
+            index=min(11,max(0,int((datetime.fromisoformat(item["finished_at"])-start).total_seconds()/width)))
+            buckets[index]["samples"]+=1
+            buckets[index]["healthy"]+=int(item["status"]=="healthy")
+        for bucket in buckets:
+            if bucket["samples"]:
+                bucket["healthy_percent"]=round(bucket["healthy"]/bucket["samples"]*100,4)
+        return {"as_of":report["as_of"],"service":objective,"observations":observations,"buckets":buckets,"trend":trend,
+            "consecutive_warnings":streak,"timed_samples":len(measured),"p95_probe_ms":measured[math.ceil(len(measured)*.95)-1] if measured else None,
+            "scope":report["scope"]}
+
     def runs(self):
         with self.db() as db:
-            rows = db.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").fetchall()
+            rows = db.execute("SELECT * FROM runs ORDER BY started_at DESC,rowid DESC LIMIT 30").fetchall()
         return [{"id": row["id"], "state": row["state"], "started_at": row["started_at"], "finished_at": row["finished_at"],
                  "report": json.loads(row["report"]) if row["report"] else None, "error": row["error"], "source": row["source"]} for row in rows]
 
@@ -542,7 +708,7 @@ CREATE TABLE IF NOT EXISTS triages(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,
                     self._observe_incident(db, source, result)
                     db.execute("INSERT INTO observations(run_id,service_id,revision,payload,maintenance_version) VALUES(?,?,?,?,?)", (identity, source["id"], source["revision"], json.dumps(result), source["maintenance_version"]))
                 db.execute("UPDATE runs SET state='completed',finished_at=?,report=? WHERE id=?", (now(), json.dumps(report), identity))
-                db.execute("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY started_at DESC LIMIT 200)")
+                db.execute("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY started_at DESC,rowid DESC LIMIT 200)")
         except Exception:
             with self.db() as db:
                 db.execute("UPDATE runs SET state='failed',finished_at=?,error=? WHERE id=?", (now(), "The check could not complete. Try again after reviewing the service settings.", identity))
@@ -735,6 +901,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     if path == "/":
                         data = data.replace("__CONSOLE_TOKEN__", self.state.token)
                     return self.response(200, data, content_type)
+                if path == "/api/reliability/review":
+                    return self.response(200,self.state.reliability_review())
+                if path.startswith("/api/reliability/"):
+                    return self.response(200,self.state.reliability_history(path.split("/")[-1]))
+                if path == "/api/reliability":
+                    return self.response(200,self.state.reliability())
                 if path == "/api/overview":
                     return self.response(200, self.state.overview())
                 if path == "/api/evidence":
@@ -764,6 +936,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self.response(200,self.state.end_maintenance(path.split("/")[3]))
             if method == "POST" and path == "/api/services":
                 return self.response(201, self.state.save_service(payload))
+            if method == "PATCH" and path.startswith("/api/services/") and path.endswith("/objective"):
+                return self.response(200,self.state.save_objective(path.split("/")[3],payload))
+            if method == "PATCH" and path.startswith("/api/services/") and path.endswith("/latency-objective"):
+                return self.response(200,self.state.save_latency_objective(path.split("/")[3],payload))
             if method == "PATCH" and path.startswith("/api/services/"):
                 return self.response(200, self.state.save_service(payload, path.split("/")[-1]))
             if method == "PATCH" and path == "/api/schedule":

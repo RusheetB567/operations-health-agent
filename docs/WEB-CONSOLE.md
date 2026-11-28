@@ -69,3 +69,19 @@ Open an incident and choose Markdown or JSON under Export incident report. Notes
 ## Save a local report copy
 
 After previewing an incident report, select Save local copy. The exact preview is saved atomically under reports/incident-exports, and its path, byte count and checksum appear in the dialog. Previews expire after 15 minutes; only the latest eight remain available. Re-preview if needed. Existing saved files are preserved and ignored by Git. This flow was verified independently of browser downloading. See [Day 4.6](DAY-4.6-REPORT.md) and [the Day 4 wrap-up](DAY-FOUR-WRAP-UP.md).
+
+## Service reliability objectives
+
+Open Reliability and choose Set objective to save a target, lookback window and minimum sample count per service. Assessments use retained completed checks for the current configuration and maintenance cycle. They show sampled-check health, not continuous uptime or a request-level SLA. Suggested defaults remain labelled until saved. See [the Day 5 report](DAY-FIVE-REPORT.md) for calculation examples and limits.
+
+## Reliability history
+
+On Reliability, select View history to inspect twelve time buckets, evidence gaps, warning streaks, P95 probe duration and the latest matching observations. Trends require at least six observations and the objective minimum, compare equal groups and remain descriptive. Close and reopen to refresh. See [Day 5.2](DAY-5.2-REPORT.md) and [the Day 5 wrap-up](DAY-FIVE-WRAP-UP.md).
+
+## Latency objectives
+
+On Reliability, choose Latency goal to enable a threshold and target for successful probes. Failed checks remain in availability and never count as latency successes. The existing lookback and sample minimum apply; incomplete successful-probe timings withhold a final latency assessment. See [Day 5.3](DAY-5.3-REPORT.md) for calculation details.
+
+## Reliability review
+
+On Reliability, filter the review panel to separate saved-target misses, missing evidence/settings, deferred work and services within saved targets. Open evidence, review an objective or follow an active incident link. The panel does not modify incident state, and unsaved defaults are not treated as committed targets. See [Day 5.4](DAY-5.4-REPORT.md).
